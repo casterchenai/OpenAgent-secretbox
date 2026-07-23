@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "status": "applied",
+  "request_id": "anthropic-local-setup",
+  "browser_opened": true,
+  "result": {
+    "request_id": "anthropic-local-setup",
+    "status": "applied",
+    "written": [
+      {
+        "type": "env",
+        "name": "ANTHROPIC_API_KEY",
+        "action": "added",
+        "target": ".env.local"
+      }
+    ],
+    "conflicts": [],
+    "missing": [],
+    "blocked": []
+  }
+}

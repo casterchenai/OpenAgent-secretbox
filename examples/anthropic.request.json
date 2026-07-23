@@ -1,13 +1,14 @@
 {
-  "request_id": "openai-local-setup",
-  "title": "OpenAI API setup",
+  "schema_version": 1,
+  "request_id": "anthropic-local-setup",
+  "title": "Anthropic API setup",
   "workspace_root": "/path/to/project",
   "needs": [
     {
       "type": "env",
-      "name": "OPENAI_API_KEY",
+      "name": "ANTHROPIC_API_KEY",
       "required": true,
-      "description": "OpenAI API key"
+      "description": "Anthropic API key"
     }
   ],
   "write_policy": {
