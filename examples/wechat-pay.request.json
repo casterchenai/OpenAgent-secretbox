@@ -1,0 +1,44 @@
+{
+  "request_id": "wechat-pay-setup",
+  "title": "WeChat Pay API v3 setup",
+  "workspace_root": "/path/to/project",
+  "needs": [
+    {
+      "type": "env",
+      "name": "WECHAT_PAY_MCH_ID",
+      "required": true,
+      "description": "WeChat Pay merchant ID"
+    },
+    {
+      "type": "env",
+      "name": "WECHAT_PAY_API_V3_KEY",
+      "required": true,
+      "description": "WeChat Pay API v3 key"
+    },
+    {
+      "type": "file",
+      "name": "apiclient_key.pem",
+      "required": true,
+      "target": "secrets/apiclient_key.pem",
+      "description": "Merchant private key PEM file"
+    },
+    {
+      "type": "env",
+      "name": "WECHAT_PAY_PRIVATE_KEY_PATH",
+      "required": true,
+      "default_value": "./secrets/apiclient_key.pem",
+      "description": "Path to merchant private key file"
+    }
+  ],
+  "allowed_targets": [
+    ".env",
+    ".env.local",
+    "secrets/*"
+  ],
+  "write_policy": {
+    "env_file": ".env.local",
+    "mode": "merge_only",
+    "no_overwrite": true,
+    "backup": true
+  }
+}

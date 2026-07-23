@@ -1,0 +1,19 @@
+{
+  "request_id": "openai-local-setup",
+  "title": "OpenAI API setup",
+  "workspace_root": "/path/to/project",
+  "needs": [
+    {
+      "type": "env",
+      "name": "OPENAI_API_KEY",
+      "required": true,
+      "description": "OpenAI API key"
+    }
+  ],
+  "write_policy": {
+    "env_file": ".env.local",
+    "mode": "merge_only",
+    "no_overwrite": true,
+    "backup": true
+  }
+}

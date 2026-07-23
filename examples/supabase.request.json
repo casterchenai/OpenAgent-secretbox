@@ -1,0 +1,31 @@
+{
+  "request_id": "supabase-local-setup",
+  "title": "Supabase setup",
+  "workspace_root": "/path/to/project",
+  "needs": [
+    {
+      "type": "env",
+      "name": "SUPABASE_URL",
+      "required": true,
+      "description": "Supabase project URL"
+    },
+    {
+      "type": "env",
+      "name": "SUPABASE_ANON_KEY",
+      "required": true,
+      "description": "Supabase anon key"
+    },
+    {
+      "type": "env",
+      "name": "SUPABASE_SERVICE_ROLE_KEY",
+      "required": false,
+      "description": "Supabase service role key, only needed for trusted backend jobs"
+    }
+  ],
+  "write_policy": {
+    "env_file": ".env.local",
+    "mode": "merge_only",
+    "no_overwrite": true,
+    "backup": true
+  }
+}
