@@ -46,15 +46,17 @@ $ErrorActionPreference = 'Stop'
 $Path = [Environment]::GetEnvironmentVariable(
   'OPENAGENT_SECRETBOX_ACL_PATH', 'Process'
 )
-$acl = Get-Acl -LiteralPath $Path
+$acl = [System.IO.File]::GetAccessControl($Path)
 $ownerSid = $acl.GetOwner(
   [System.Security.Principal.SecurityIdentifier]
 ).Value
 $rules = @(
-  foreach ($rule in @($acl.Access)) {
-    $ruleSid = $rule.IdentityReference.Translate(
-      [System.Security.Principal.SecurityIdentifier]
-    ).Value
+  foreach ($rule in @($acl.GetAccessRules(
+    $true,
+    $true,
+    [System.Security.Principal.SecurityIdentifier]
+  ))) {
+    $ruleSid = $rule.IdentityReference.Value
     [PSCustomObject]@{
       'sid' = $ruleSid
       'allow' = [bool](
@@ -189,7 +191,7 @@ def _inspect_windows_acl(
             check=False,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=5,
             creationflags=creation_flags,
             env=environment,
             cwd=str(Path(powershell).parent),

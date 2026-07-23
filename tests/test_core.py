@@ -309,6 +309,16 @@ def test_windows_acl_check_reports_secure_target_without_mutation(
     assert environment["OPENAGENT_SECRETBOX_ACL_PATH"] == str(target)
 
 
+def test_windows_acl_inspection_script_uses_sid_typed_framework_apis() -> None:
+    script = writers._WINDOWS_ACL_INSPECT_SCRIPT
+
+    assert "[System.IO.File]::GetAccessControl" in script
+    assert "$acl.GetAccessRules(" in script
+    assert "[System.Security.Principal.SecurityIdentifier]" in script
+    assert ".Translate(" not in script
+    assert "Get-Acl" not in script
+
+
 def test_windows_acl_repair_uses_icacls_and_verifies_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -439,7 +449,7 @@ def test_windows_acl_inspection_timeout_is_fail_closed_and_redacted(
     with pytest.raises(WriteError, match="unable to inspect Windows permissions") as raised:
         writers._set_windows_owner_only(target)
 
-    assert seen_timeout == [30]
+    assert seen_timeout == [5]
     assert len(commands) == 1
     assert "sensitive-timeout" not in str(raised.value)
     assert str(target) not in str(raised.value)
