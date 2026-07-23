@@ -26,6 +26,9 @@ classifiers = [
   "Topic :: Security",
   "Topic :: Software Development :: Libraries :: Python Modules"
 ]
+dependencies = [
+  "pywin32>=311,<313; sys_platform == 'win32'"
+]
 
 [project.urls]
 Homepage = "https://github.com/casterchenai/OpenAgent-secretbox"

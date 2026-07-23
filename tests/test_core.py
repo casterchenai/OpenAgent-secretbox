@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,8 +25,84 @@ def _trusted_windows_test_executable(*parts: str) -> str:
     return str(PureWindowsPath("C:/Windows/System32", *parts))
 
 
-def _trusted_windows_test_environment(extra: dict[str, str]) -> dict[str, str]:
-    return {"SystemRoot": r"C:\Windows", **extra}
+class _FakeSid:
+    def __init__(self, value: str, *, valid: bool = True) -> None:
+        self.value = value
+        self.valid = valid
+
+    def IsValid(self) -> bool:
+        return self.valid
+
+
+class _FakeAcl:
+    def __init__(self, aces: list[object], *, valid: bool = True) -> None:
+        self.aces = aces
+        self.valid = valid
+
+    def IsValid(self) -> bool:
+        return self.valid
+
+    def GetAceCount(self) -> int:
+        return len(self.aces)
+
+    def GetAce(self, index: int) -> object:
+        return self.aces[index]
+
+
+class _FakeSecurityDescriptor:
+    def __init__(
+        self,
+        *,
+        owner: _FakeSid | None,
+        dacl: _FakeAcl | None,
+        control: int = 0x1000,
+    ) -> None:
+        self.owner = owner
+        self.dacl = dacl
+        self.control = control
+
+    def GetSecurityDescriptorOwner(self) -> _FakeSid | None:
+        return self.owner
+
+    def GetSecurityDescriptorDacl(self) -> _FakeAcl | None:
+        return self.dacl
+
+    def GetSecurityDescriptorControl(self) -> tuple[int, int]:
+        return self.control, 1
+
+
+class _FakeWin32Security:
+    SE_FILE_OBJECT = 1
+    OWNER_SECURITY_INFORMATION = 1
+    DACL_SECURITY_INFORMATION = 4
+    SE_DACL_PROTECTED = 0x1000
+    ACCESS_ALLOWED_ACE_TYPE = 0
+    ACCESS_DENIED_ACE_TYPE = 1
+    INHERIT_ONLY_ACE = 8
+
+    def __init__(self, descriptor: _FakeSecurityDescriptor) -> None:
+        self.descriptor = descriptor
+        self.calls: list[tuple[str, int, int]] = []
+
+    def GetNamedSecurityInfo(self, path: str, object_type: int, information: int) -> object:
+        self.calls.append((path, object_type, information))
+        return self.descriptor
+
+    @staticmethod
+    def ConvertSidToStringSid(sid: _FakeSid) -> str:
+        return sid.value
+
+    @staticmethod
+    def MapGenericMask(mask: int, mapping: tuple[int, int, int, int]) -> int:
+        return mapping[3] if mask & 0x10000000 else mask
+
+
+_FAKE_NT_SECURITY = SimpleNamespace(
+    FILE_GENERIC_READ=0x00120089,
+    FILE_GENERIC_WRITE=0x00120116,
+    FILE_GENERIC_EXECUTE=0x001200A0,
+    FILE_ALL_ACCESS=0x001F01FF,
+)
 
 
 def request_for(workspace: Path) -> dict:
@@ -272,51 +349,57 @@ def test_windows_acl_check_reports_secure_target_without_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "private.pem"
-    seen: dict[str, object] = {}
     sid = "S-1-5-21-test"
-    snapshot = json.dumps(
-        {
-            "owner": sid,
-            "protected": True,
-            "rules": [{"sid": sid, "allow": True, "full_control": True}],
-        }
-    )
-
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        seen["command"] = command
-        seen["environment"] = kwargs["env"]
-        return subprocess.CompletedProcess(command, 0, stdout=snapshot, stderr="")
+    mutations: list[tuple[Path, tuple[str, ...]]] = []
 
     monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
     monkeypatch.setattr(
-        writers, "_windows_system_executable", _trusted_windows_test_executable
+        writers,
+        "_inspect_windows_acl",
+        lambda _path: (sid, True, ((sid, True, True),)),
     )
     monkeypatch.setattr(
-        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+        writers,
+        "_run_icacls",
+        lambda path, *arguments: mutations.append((path, arguments)),
     )
-    monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
     assert writers._set_windows_owner_only(target) is False
-    assert seen["command"] == [
-        _trusted_windows_test_executable("WindowsPowerShell", "v1.0", "powershell.exe"),
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        writers._WINDOWS_ACL_INSPECT_SCRIPT,
-    ]
-    environment = seen["environment"]
-    assert isinstance(environment, dict)
-    assert environment["OPENAGENT_SECRETBOX_ACL_PATH"] == str(target)
+    assert mutations == []
 
 
-def test_windows_acl_inspection_script_uses_sid_typed_framework_apis() -> None:
-    script = writers._WINDOWS_ACL_INSPECT_SCRIPT
+def test_windows_acl_inspection_uses_native_sid_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _FakeSid("S-1-5-21-owner")
+    other = _FakeSid("S-1-1-0")
+    descriptor = _FakeSecurityDescriptor(
+        owner=owner,
+        dacl=_FakeAcl(
+            [
+                ((0, 0), 0x10000000, owner),
+                ((1, 0), 0x00120089, other),
+            ]
+        ),
+    )
+    security = _FakeWin32Security(descriptor)
+    monkeypatch.setattr(
+        writers,
+        "_windows_acl_libraries",
+        lambda: (security, _FAKE_NT_SECURITY),
+    )
+    target = tmp_path / "private.pem"
 
-    assert "[System.IO.File]::GetAccessControl" in script
-    assert "$acl.GetAccessRules(" in script
-    assert "[System.Security.Principal.SecurityIdentifier]" in script
-    assert ".Translate(" not in script
-    assert "Get-Acl" not in script
+    assert writers._inspect_windows_acl(target) == (
+        "S-1-5-21-owner",
+        True,
+        (
+            ("S-1-5-21-owner", True, True),
+            ("S-1-1-0", False, False),
+        ),
+    )
+    assert security.calls == [(str(target), 1, 5)]
 
 
 def test_windows_acl_repair_uses_icacls_and_verifies_result(
@@ -328,130 +411,98 @@ def test_windows_acl_repair_uses_icacls_and_verifies_result(
     other_sid = "S-1-1-0"
     snapshots = iter(
         [
-            json.dumps(
-                {
-                    "owner": sid,
-                    "protected": False,
-                    "rules": [
-                        {"sid": other_sid, "allow": True, "full_control": False},
-                    ],
-                }
-            ),
-            json.dumps(
-                {
-                    "owner": sid,
-                    "protected": True,
-                    "rules": [{"sid": sid, "allow": True, "full_control": True}],
-                }
-            ),
+            (sid, False, ((other_sid, True, False),)),
+            (sid, True, ((sid, True, True),)),
         ]
     )
-    commands: list[list[str]] = []
-
-    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        powershell = _trusted_windows_test_executable(
-            "WindowsPowerShell", "v1.0", "powershell.exe"
-        )
-        stdout = next(snapshots) if command[0] == powershell else ""
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+    commands: list[tuple[Path, tuple[str, ...]]] = []
 
     monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
     monkeypatch.setattr(
-        writers, "_windows_system_executable", _trusted_windows_test_executable
+        writers, "_inspect_windows_acl", lambda _path: next(snapshots)
     )
     monkeypatch.setattr(
-        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+        writers,
+        "_run_icacls",
+        lambda path, *arguments: commands.append((path, arguments)),
     )
-    monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
     assert writers._set_windows_owner_only(target) is True
-    powershell = _trusted_windows_test_executable(
-        "WindowsPowerShell", "v1.0", "powershell.exe"
-    )
-    icacls = _trusted_windows_test_executable("icacls.exe")
     assert commands == [
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            writers._WINDOWS_ACL_INSPECT_SCRIPT,
-        ],
-        [icacls, str(target), "/grant:r", f"*{sid}:(F)"],
-        [icacls, str(target), "/remove:d", f"*{sid}"],
-        [icacls, str(target), "/grant:r", f"*{sid}:(F)"],
-        [icacls, str(target), "/setowner", f"*{sid}"],
-        [icacls, str(target), "/inheritance:r"],
-        [icacls, str(target), "/remove", f"*{other_sid}"],
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            writers._WINDOWS_ACL_INSPECT_SCRIPT,
-        ],
+        (target, ("/grant:r", f"*{sid}:(F)")),
+        (target, ("/remove:d", f"*{sid}")),
+        (target, ("/grant:r", f"*{sid}:(F)")),
+        (target, ("/setowner", f"*{sid}")),
+        (target, ("/inheritance:r",)),
+        (target, ("/remove", f"*{other_sid}")),
     ]
 
 
 @pytest.mark.parametrize(
-    "stdout",
-    ["not-json", '{"owner":"S-1-5-21-test","protected":true,"rules":{}}'],
+    "descriptor",
+    [
+        _FakeSecurityDescriptor(owner=_FakeSid("S-1-5-21-owner"), dacl=None),
+        _FakeSecurityDescriptor(
+            owner=_FakeSid("S-1-5-21-owner"),
+            dacl=_FakeAcl([((5, 0), 0x001F01FF, _FakeSid("S-1-5-21-owner"))]),
+        ),
+        _FakeSecurityDescriptor(
+            owner=_FakeSid("S-1-5-21-owner"),
+            dacl=_FakeAcl([((0, 8), 0x001F01FF, _FakeSid("S-1-5-21-owner"))]),
+        ),
+        _FakeSecurityDescriptor(
+            owner=_FakeSid("S-1-5-21-owner"),
+            dacl=_FakeAcl([((0, "invalid"), 0x001F01FF, _FakeSid("S-1-5-21-owner"))]),
+        ),
+        _FakeSecurityDescriptor(
+            owner=_FakeSid("S-1-5-21-owner", valid=False),
+            dacl=_FakeAcl([]),
+        ),
+        _FakeSecurityDescriptor(
+            owner=_FakeSid("S-1-5-21-owner"),
+            dacl=_FakeAcl([], valid=False),
+        ),
+    ],
 )
-def test_windows_acl_inspection_rejects_unexpected_output(
+def test_windows_acl_inspection_rejects_unsafe_native_snapshots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    stdout: str,
+    descriptor: _FakeSecurityDescriptor,
 ) -> None:
-    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(writers, "_windows_current_sid", lambda: "S-1-5-21-test")
+    security = _FakeWin32Security(descriptor)
     monkeypatch.setattr(
-        writers, "_windows_system_executable", _trusted_windows_test_executable
+        writers,
+        "_windows_acl_libraries",
+        lambda: (security, _FAKE_NT_SECURITY),
     )
-    monkeypatch.setattr(
-        writers, "_windows_powershell_environment", _trusted_windows_test_environment
-    )
-    monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
     with pytest.raises(WriteError, match="unable to inspect Windows permissions"):
-        writers._set_windows_owner_only(tmp_path / "private.pem")
+        writers._inspect_windows_acl(tmp_path / "private.pem")
 
 
-def test_windows_acl_inspection_timeout_is_fail_closed_and_redacted(
+def test_windows_acl_native_failure_is_fail_closed_and_redacted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = tmp_path / "private.pem"
-    commands: list[list[str]] = []
-    seen_timeout: list[object] = []
-
-    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        seen_timeout.append(kwargs["timeout"])
-        raise subprocess.TimeoutExpired(
-            command,
-            kwargs["timeout"],
-            output="sensitive-timeout-output",
-            stderr="sensitive-timeout-error",
-        )
-
-    monkeypatch.setattr(writers, "_windows_current_sid", lambda: "S-1-5-21-test")
-    monkeypatch.setattr(
-        writers, "_windows_system_executable", _trusted_windows_test_executable
+    security = _FakeWin32Security(
+        _FakeSecurityDescriptor(owner=_FakeSid("S-1-5-21-owner"), dacl=_FakeAcl([]))
     )
+
+    def fail(*_args: object) -> object:
+        raise RuntimeError(f"sensitive-native-error:{target}")
+
+    security.GetNamedSecurityInfo = fail  # type: ignore[method-assign]
     monkeypatch.setattr(
-        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+        writers,
+        "_windows_acl_libraries",
+        lambda: (security, _FAKE_NT_SECURITY),
     )
-    monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
     with pytest.raises(WriteError, match="unable to inspect Windows permissions") as raised:
-        writers._set_windows_owner_only(target)
+        writers._inspect_windows_acl(target)
 
-    assert seen_timeout == [5]
-    assert len(commands) == 1
-    assert "sensitive-timeout" not in str(raised.value)
+    assert "sensitive-native-error" not in str(raised.value)
     assert str(target) not in str(raised.value)
 
 
@@ -460,20 +511,7 @@ def test_windows_acl_command_failure_is_fail_closed_and_redacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sid = "S-1-5-21-test"
-    insecure = json.dumps(
-        {
-            "owner": sid,
-            "protected": False,
-            "rules": [{"sid": "S-1-1-0", "allow": True, "full_control": False}],
-        }
-    )
-
     def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        powershell = _trusted_windows_test_executable(
-            "WindowsPowerShell", "v1.0", "powershell.exe"
-        )
-        if command[0] == powershell:
-            return subprocess.CompletedProcess(command, 0, stdout=insecure, stderr="")
         return subprocess.CompletedProcess(
             command,
             5,
@@ -486,7 +524,9 @@ def test_windows_acl_command_failure_is_fail_closed_and_redacted(
         writers, "_windows_system_executable", _trusted_windows_test_executable
     )
     monkeypatch.setattr(
-        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+        writers,
+        "_inspect_windows_acl",
+        lambda _path: (sid, False, (("S-1-1-0", True, False),)),
     )
     monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
@@ -499,16 +539,14 @@ def test_windows_acl_command_failure_is_fail_closed_and_redacted(
 def test_windows_system_executables_ignore_workspace_shadows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in ("whoami.exe", "icacls.exe", "powershell.exe"):
+    for name in ("whoami.exe", "icacls.exe"):
         (tmp_path / name).write_bytes(b"workspace-shadow")
     fake_root = tmp_path / "fake-windows"
     fake_system = fake_root / "System32"
-    fake_powershell = fake_system / "WindowsPowerShell" / "v1.0"
-    fake_powershell.mkdir(parents=True)
+    fake_system.mkdir(parents=True)
     for path in (
         fake_system / "whoami.exe",
         fake_system / "icacls.exe",
-        fake_powershell / "powershell.exe",
     ):
         path.write_bytes(b"environment-shadow")
     monkeypatch.setenv("SystemRoot", str(fake_root))
@@ -520,11 +558,6 @@ def test_windows_system_executables_ignore_workspace_shadows(
     resolved = [
         Path(writers._windows_system_executable("whoami.exe")),
         Path(writers._windows_system_executable("icacls.exe")),
-        Path(
-            writers._windows_system_executable(
-                "WindowsPowerShell", "v1.0", "powershell.exe"
-            )
-        ),
     ]
 
     assert all(path.is_absolute() and path.is_file() for path in resolved)

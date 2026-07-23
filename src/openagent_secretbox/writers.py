@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import ctypes
-import json
 import os
 import re
 import stat
@@ -40,44 +39,6 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _ENV_LINE_RE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]{0,127})[ \t]*=(.*)$")
 _REPARSE_POINT = 0x0400
 DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024
-
-_WINDOWS_ACL_INSPECT_SCRIPT = r"""
-$ErrorActionPreference = 'Stop'
-$Path = [Environment]::GetEnvironmentVariable(
-  'OPENAGENT_SECRETBOX_ACL_PATH', 'Process'
-)
-$acl = [System.IO.File]::GetAccessControl($Path)
-$ownerSid = $acl.GetOwner(
-  [System.Security.Principal.SecurityIdentifier]
-).Value
-$rules = @(
-  foreach ($rule in @($acl.GetAccessRules(
-    $true,
-    $true,
-    [System.Security.Principal.SecurityIdentifier]
-  ))) {
-    $ruleSid = $rule.IdentityReference.Value
-    [PSCustomObject]@{
-      'sid' = $ruleSid
-      'allow' = [bool](
-        $rule.AccessControlType -eq
-          [System.Security.AccessControl.AccessControlType]::Allow
-      )
-      'full_control' = [bool](
-        ($rule.FileSystemRights -band
-          [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
-          [System.Security.AccessControl.FileSystemRights]::FullControl
-      )
-    }
-  }
-)
-[PSCustomObject]@{
-  'owner' = $ownerSid
-  'protected' = [bool]$acl.AreAccessRulesProtected
-  'rules' = $rules
-} | ConvertTo-Json -Compress -Depth 3
-"""
-
 
 @lru_cache(maxsize=1)
 def _windows_system_directory() -> Path:
@@ -123,84 +84,90 @@ def _windows_system_executable(*relative_parts: str) -> str:
     return str(candidate)
 
 
-def _windows_powershell_environment(extra: Mapping[str, str]) -> dict[str, str]:
-    system_directory = _windows_system_directory()
-    windows_directory = system_directory.parent
-    environment = {
-        "SystemRoot": str(windows_directory),
-        "WINDIR": str(windows_directory),
-        "ComSpec": str(system_directory / "cmd.exe"),
-        "PATH": str(system_directory),
-        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
-        "PSModulePath": str(system_directory / "WindowsPowerShell" / "v1.0" / "Modules"),
-    }
-    environment.update(extra)
-    return environment
-
-
-def _parse_windows_acl_snapshot(value: str) -> tuple[str, bool, tuple[tuple[str, bool, bool], ...]]:
+@lru_cache(maxsize=1)
+def _windows_acl_libraries() -> tuple[Any, Any]:
+    if os.name != "nt":
+        raise WriteError("unable to inspect Windows permissions")
     try:
-        payload = json.loads(value)
-    except (json.JSONDecodeError, TypeError) as exc:
+        import ntsecuritycon  # type: ignore[import-untyped]
+        import win32security  # type: ignore[import-untyped]
+    except ImportError as exc:
         raise WriteError("unable to inspect Windows permissions") from exc
-    if not isinstance(payload, dict):
-        raise WriteError("unable to inspect Windows permissions")
-    owner = payload.get("owner")
-    protected = payload.get("protected")
-    raw_rules = payload.get("rules")
-    if not isinstance(owner, str) or not owner.startswith("S-"):
-        raise WriteError("unable to inspect Windows permissions")
-    if not isinstance(protected, bool) or not isinstance(raw_rules, list):
-        raise WriteError("unable to inspect Windows permissions")
-    rules: list[tuple[str, bool, bool]] = []
-    for raw_rule in raw_rules:
-        if not isinstance(raw_rule, dict):
-            raise WriteError("unable to inspect Windows permissions")
-        sid = raw_rule.get("sid")
-        allow = raw_rule.get("allow")
-        full_control = raw_rule.get("full_control")
-        if (
-            not isinstance(sid, str)
-            or not sid.startswith("S-")
-            or not isinstance(allow, bool)
-            or not isinstance(full_control, bool)
-        ):
-            raise WriteError("unable to inspect Windows permissions")
-        rules.append((sid, allow, full_control))
-    return owner, protected, tuple(rules)
+    return win32security, ntsecuritycon
 
 
 def _inspect_windows_acl(
     path: Path,
-    *,
-    environment: Mapping[str, str],
 ) -> tuple[str, bool, tuple[tuple[str, bool, bool], ...]]:
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    powershell = _windows_system_executable(
-        "WindowsPowerShell", "v1.0", "powershell.exe"
-    )
     try:
-        result = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                _WINDOWS_ACL_INSPECT_SCRIPT,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=creation_flags,
-            env=environment,
-            cwd=str(Path(powershell).parent),
+        win32security, ntsecuritycon = _windows_acl_libraries()
+        descriptor = win32security.GetNamedSecurityInfo(
+            str(path),
+            win32security.SE_FILE_OBJECT,
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+        owner = descriptor.GetSecurityDescriptorOwner()
+        dacl = descriptor.GetSecurityDescriptorDacl()
+        control, _revision = descriptor.GetSecurityDescriptorControl()
+        if owner is None or dacl is None or not owner.IsValid() or not dacl.IsValid():
+            raise WriteError("unable to inspect Windows permissions")
+
+        owner_sid = win32security.ConvertSidToStringSid(owner)
+        if not isinstance(owner_sid, str) or not owner_sid.startswith("S-"):
+            raise WriteError("unable to inspect Windows permissions")
+
+        generic_mapping = (
+            ntsecuritycon.FILE_GENERIC_READ,
+            ntsecuritycon.FILE_GENERIC_WRITE,
+            ntsecuritycon.FILE_GENERIC_EXECUTE,
+            ntsecuritycon.FILE_ALL_ACCESS,
+        )
+        rules: list[tuple[str, bool, bool]] = []
+        ace_count = dacl.GetAceCount()
+        if type(ace_count) is not int or not 0 <= ace_count <= 65_535:
+            raise WriteError("unable to inspect Windows permissions")
+        for index in range(ace_count):
+            ace = dacl.GetAce(index)
+            if not isinstance(ace, tuple) or len(ace) != 3:
+                raise WriteError("unable to inspect Windows permissions")
+            header, mask, sid = ace
+            if (
+                not isinstance(header, tuple)
+                or len(header) != 2
+                or type(header[0]) is not int
+                or type(header[1]) is not int
+                or type(mask) is not int
+                or not sid.IsValid()
+            ):
+                raise WriteError("unable to inspect Windows permissions")
+            ace_type = header[0]
+            ace_flags = header[1]
+            if ace_type not in {
+                win32security.ACCESS_ALLOWED_ACE_TYPE,
+                win32security.ACCESS_DENIED_ACE_TYPE,
+            } or ace_flags & win32security.INHERIT_ONLY_ACE:
+                raise WriteError("unable to inspect Windows permissions")
+            sid_value = win32security.ConvertSidToStringSid(sid)
+            if not isinstance(sid_value, str) or not sid_value.startswith("S-"):
+                raise WriteError("unable to inspect Windows permissions")
+            mapped_mask = win32security.MapGenericMask(mask, generic_mapping)
+            if type(mapped_mask) is not int:
+                raise WriteError("unable to inspect Windows permissions")
+            rules.append(
+                (
+                    sid_value,
+                    ace_type == win32security.ACCESS_ALLOWED_ACE_TYPE,
+                    mapped_mask & ntsecuritycon.FILE_ALL_ACCESS
+                    == ntsecuritycon.FILE_ALL_ACCESS,
+                )
+            )
+        protected = bool(control & win32security.SE_DACL_PROTECTED)
+    except WriteError:
+        raise
+    except Exception as exc:
         raise WriteError("unable to inspect Windows permissions") from exc
-    if result.returncode != 0:
-        raise WriteError("unable to inspect Windows permissions")
-    return _parse_windows_acl_snapshot(result.stdout.strip())
+    return owner_sid, protected, tuple(rules)
 
 
 def _run_icacls(path: Path, *arguments: str) -> None:
@@ -230,10 +197,7 @@ def _windows_acl_is_owner_only(
 
 def _set_windows_owner_only(path: Path) -> bool:
     sid = _windows_current_sid()
-    environment = _windows_powershell_environment(
-        {"OPENAGENT_SECRETBOX_ACL_PATH": str(path)}
-    )
-    before = _inspect_windows_acl(path, environment=environment)
+    before = _inspect_windows_acl(path)
     if _windows_acl_is_owner_only(before, sid):
         return False
 
@@ -248,7 +212,7 @@ def _set_windows_owner_only(path: Path) -> bool:
     for rule_sid in sorted({rule[0] for rule in before[2]} - {sid}):
         _run_icacls(path, "/remove", f"*{rule_sid}")
 
-    verified = _inspect_windows_acl(path, environment=environment)
+    verified = _inspect_windows_acl(path)
     if not _windows_acl_is_owner_only(verified, sid):
         raise WriteError("unable to verify owner-only Windows permissions")
     return True
