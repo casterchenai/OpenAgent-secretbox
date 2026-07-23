@@ -18,14 +18,17 @@ At the same time, telling non-expert users to manually edit `.env` files, upload
 
 OpenAgent SecretBox will be a local-first secret intake broker.
 
-Agents declare required secrets through a schema. Users provide values through an isolated intake UI. SecretBox applies values to allowed workspace targets and returns only redacted status to the agent.
+Agents declare required secrets through a schema. Users provide values through a
+separate loopback intake UI. SecretBox applies values to allowed workspace targets
+and returns only redacted status to the agent.
 
 Default behavior:
 
 - no secret values returned to the agent
 - merge-only env writes
 - no overwrite without explicit approval
-- backups before modification
+- no persistent backup by default; any future retained recovery copy needs a
+  trusted retention policy and owner-only storage
 - path allowlists
 - restrictive file permissions
 - redacted audit logs

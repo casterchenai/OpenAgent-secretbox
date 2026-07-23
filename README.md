@@ -11,7 +11,7 @@ It solves a practical contradiction in agent-assisted development:
 OpenAgent SecretBox gives the agent a safe protocol:
 
 1. The agent declares what secrets it needs.
-2. The user enters or uploads those secrets in an isolated intake window.
+2. The user enters or uploads those secrets in a separate loopback intake window.
 3. SecretBox writes them to approved local targets using safe merge rules.
 4. The agent receives only a redacted result: what was written, where it was written, and whether anything is missing or blocked.
 
@@ -21,17 +21,33 @@ The AI agent does **not** need to see the secret values.
 
 ## Project status
 
-This repository is at the initial design and MVP planning stage.
+This repository now contains a local-only `0.1.0a1` pre-release MVP. It
+includes strict request validation, merge-only writers, path policy checks,
+redacted status data, a loopback intake server, and an installable CLI.
 
-The first milestone is a small Python-based prototype:
+It has not received an independent security assessment. Remote intake is not
+enabled by the CLI; the supported server binds to `127.0.0.1` only.
 
-- local web intake page
-- one-time request token
-- `.env` merge-only writer
-- private file upload into `secrets/`
-- automatic backups
-- `0600` file permissions where supported
-- redacted JSON status output for agents
+Install a development checkout and validate an example:
+
+```bash
+uv sync --extra dev
+uv run secretbox --json validate examples/openai.request.json
+```
+
+Start local intake directly:
+
+```bash
+uv run secretbox serve \
+  --workspace /path/to/project \
+  --request examples/openai.request.json
+```
+
+If the request declares `workspace_root`, it must match `--workspace`. By default, SecretBox
+opens the one-time intake URL in the user's browser and does not print the bearer
+token. The token is carried in a URL fragment, cleared before exchange, and never
+sent in an HTTP request path. `--no-open` prints that sensitive URL for headless use; never paste it
+into chat, logs, issues, or shell history.
 
 ---
 
@@ -84,8 +100,8 @@ SecretBox applies those values according to a strict policy:
 - merge-only `.env` updates
 - conflict detection
 - target path allowlists
-- automatic backup before write
-- redacted audit logs
+- atomic replacement without persistent backup by default
+- redacted status output; persistent audit logging remains future work
 - restrictive file permissions
 
 ---
@@ -137,22 +153,21 @@ OpenAgent SecretBox starts with a realistic and valuable goal:
 +----------+----------+
 |  OpenAgent SecretBox|
 |---------------------|
-| Request registry    |
+| one-time sessions   |
 | policy engine       |
 | env merge writer    |
 | file writer         |
-| audit logger        |
 +----------+----------+
            ^
            |
            | user submits values
 +----------+----------+
-|  Isolated Intake UI |
+|  Loopback Intake UI |
 |---------------------|
 | paste env vars      |
 | paste API keys      |
 | upload PEM/JSON     |
-| approve conflicts   |
+| show write policy   |
 +----------+----------+
            |
            | controlled writes
@@ -206,17 +221,18 @@ Example:
     "env_file": ".env.local",
     "mode": "merge_only",
     "no_overwrite": true,
-    "backup": true
+    "backup": false
   }
 }
 ```
 
 ### 2. SecretBox opens an intake session
 
-A local or remote intake URL is generated:
+A local-only intake URL is generated. The session id is sent in the path while
+the bearer token remains in the browser fragment:
 
 ```text
-http://127.0.0.1:17321/intake?token=one-time-token
+http://127.0.0.1:17321/intake/ses_random#token=one-time-token
 ```
 
 The token should be:
@@ -224,7 +240,7 @@ The token should be:
 - high entropy
 - bound to one request
 - short-lived
-- single-use after successful apply
+- consumed atomically during the initial session exchange
 
 ### 3. User enters values outside the chat
 
@@ -233,8 +249,8 @@ The user can:
 - paste individual API keys
 - paste `.env`-style variables
 - upload private files such as `.pem`, `.json`, `.p12`
-- review conflicts
-- approve or reject overwrites if policy allows it
+- review declared targets and the enforced write policy
+- cancel the session without submitting values
 
 Values go directly to SecretBox, not to the chat.
 
@@ -246,8 +262,8 @@ For environment files:
 - preserve existing comments and unrelated values where possible
 - append missing values
 - skip identical values
-- block changed values unless explicitly approved
-- back up before modification
+- block changed values; the alpha CLI has no overwrite approval path
+- avoid persistent backups, which would create another secret copy
 
 For uploaded files:
 
@@ -295,13 +311,26 @@ No secret value appears in this response.
 
 ---
 
-## Proposed command-line interface
+## Command-line interface
 
-The exact CLI may change. The MVP can start with commands like these:
+Validate request metadata without accepting secret values:
 
 ```bash
+secretbox --json validate ./secret-request.json
+```
+
+Create a local metadata-only registry entry. `request create` is an alias:
+
+```bash
+secretbox create ./secret-request.json
 secretbox request create ./secret-request.json
 ```
+
+This registry is optional in `0.1.0a1`. It is not connected to a running
+`serve` process: `status` reports only the metadata record created by `create`,
+while `serve` waits and returns its own final redacted result.
+
+Start a one-time loopback intake session:
 
 ```bash
 secretbox serve \
@@ -310,6 +339,16 @@ secretbox serve \
   --ttl 600
 ```
 
+The trusted CLI policy authorizes `.env`, `.env.*`, and `secrets/*` by default.
+Use a repeated `--allow-target PATTERN` option to authorize an additional target;
+request-provided allowlists can narrow access but cannot expand this host policy.
+Uploads are limited to 10 MiB per declared file and 16 MiB for the complete HTTP request.
+
+The person running `secretbox serve` is the policy authority. Do not let an
+untrusted agent choose `--workspace` or `--allow-target`. This local MVP reduces
+chat leakage and accidental writes; it does not isolate an agent that already has
+unrestricted shell access as the same OS user.
+
 ```bash
 secretbox status <request-id>
 ```
@@ -317,6 +356,68 @@ secretbox status <request-id>
 ```bash
 secretbox doctor --workspace /path/to/project
 ```
+
+Add `--json` before or after a command for machine-readable output. Unsupported
+or invalid operations return a non-zero exit code. Secret values are never accepted
+as command-line arguments.
+
+With `--json --no-open`, stdout is a two-line JSON event stream: the first event
+is `awaiting_input` and contains the explicitly marked sensitive bearer URL; the
+second is the final redacted `applied`, `failed`, or `expired` result. Do not send
+the first event to shared logs.
+
+### MCP agent integration
+
+Install the optional MCP support:
+
+```bash
+python -m pip install -e ".[mcp]"
+```
+
+Configure an MCP client to start SecretBox over stdio with a workspace chosen by
+the trusted user:
+
+```json
+{
+  "mcpServers": {
+    "openagent-secretbox": {
+      "command": "secretbox-mcp",
+      "args": ["--workspace", "/absolute/path/to/project"]
+    }
+  }
+}
+```
+
+The server exposes three tools:
+
+| Tool | Purpose |
+|---|---|
+| `open_secret_intake` | Validate metadata and open the one-time form directly in the local browser |
+| `get_secret_intake_status` | Return lifecycle state and a structured, redacted write result |
+| `cancel_secret_intake` | Atomically cancel before secret application starts |
+
+The MCP process fixes `--workspace`, the host target allowlist, and the maximum
+active intake count at startup. Tool arguments cannot change those controls.
+The open tool returns an opaque MCP intake handle for status and cancellation,
+but never returns the browser session id, bearer URL, URL fragment, or token.
+Browser launch failure closes the listener and returns a stable error code.
+
+TTL limits how long a user may begin submission. Once secret application has
+started, it runs to an authoritative `applied` or `failed` result and cannot be
+safely interrupted. A concurrent cancel returns `apply_in_progress`; poll status
+for the real terminal result. SecretBox never reports `cancelled` while writes
+may still complete.
+
+`--allow-target` expands write authority and therefore belongs only in
+user-reviewed MCP startup configuration. Do not let an agent construct the MCP
+server command or pass secret values in request metadata. The stdio process
+reserves stdout for MCP protocol frames and closes all active listeners on exit.
+
+See [the result protocol](./docs/result-protocol.md), its
+[JSON Schema](./schemas/result-v1.json), and the
+[Hermes integration](./integrations/hermes/README.md). The sensitive bootstrap
+event emitted by CLI `--no-open --json` is deliberately outside the agent-safe
+result protocol.
 
 Later versions may support controlled command execution:
 
@@ -332,6 +433,11 @@ In that mode, secrets are injected into a child process but are still not printe
 
 OpenAgent SecretBox should default to conservative behavior.
 
+`0.1.0a1` guarantees atomic replacement per target file, not a distributed
+transaction across several targets. If a later target is blocked after an earlier
+write succeeds, the result is explicitly `partial` and the intake UI does not
+report success.
+
 ### Environment files
 
 | Situation | Default behavior |
@@ -339,7 +445,7 @@ OpenAgent SecretBox should default to conservative behavior.
 | variable does not exist | add it |
 | variable exists with same value | skip |
 | variable exists with different value | block and report conflict |
-| variable exists but is empty | add only with approval or policy rule |
+| variable exists but is empty | block and report conflict |
 | multi-line secret | prefer file write plus `*_PATH` env var |
 
 ### Files
@@ -347,7 +453,8 @@ OpenAgent SecretBox should default to conservative behavior.
 | Situation | Default behavior |
 |---|---|
 | target file does not exist | create with restrictive permissions |
-| target file exists | block unless overwrite is explicitly allowed |
+| target file exists with identical content | verify/repair owner-only permissions, then skip |
+| target file exists with different content | block in the alpha CLI |
 | target path escapes workspace | reject |
 | target path is not allowlisted | reject |
 | upload exceeds size limit | reject |
@@ -356,40 +463,29 @@ OpenAgent SecretBox should default to conservative behavior.
 
 ## Path policy
 
-A request should define where SecretBox is allowed to write.
+A request describes desired targets but does not authorize them. The trusted CLI
+policy defines where SecretBox may write.
 
-Example:
+Example host authorization:
 
-```json
-{
-  "workspace_root": "/opt/my-app",
-  "allowed_targets": [
-    ".env",
-    ".env.local",
-    "secrets/*",
-    "config/*.json"
-  ],
-  "forbidden_targets": [
-    ".git/*",
-    "node_modules/*",
-    "/etc/*",
-    "/root/.ssh/*"
-  ]
-}
+```bash
+secretbox serve --workspace /opt/my-app --request request.json \
+  --allow-target "config/*.json"
 ```
 
 Rules:
 
 - all relative paths are resolved under `workspace_root`
-- absolute targets are rejected unless explicitly allowed by policy
+- absolute targets are always rejected
 - `..` path traversal is rejected after normalization
-- symlinks require special handling and should be rejected in the MVP
+- symlinks, Windows reparse points/junctions, and hard-linked files are rejected
 
 ---
 
 ## Audit logs
 
-OpenAgent SecretBox should produce useful audit logs without leaking secrets.
+Persistent audit logging is not implemented in `0.1.0a1`. A future audit backend
+must use an allowlisted metadata schema and never log intake bodies or values.
 
 Example:
 
@@ -412,8 +508,7 @@ Example:
       "action": "created",
       "mode": "0600"
     }
-  ],
-  "backup": ".env.local.backup.20260723-153012"
+  ]
 }
 ```
 
@@ -441,7 +536,8 @@ SecretBox writes into the local project workspace.
 
 ### Remote server mode
 
-Best for cloud instances or remote deployments.
+Remote intake is not implemented or supported by the current CLI. The following
+describes a future deployment mode and must not be treated as an operating guide.
 
 ```text
 Agent starts a temporary SecretBox intake service on the server.
@@ -455,7 +551,7 @@ Remote mode needs stricter protection:
 
 - one-time token
 - short TTL
-- HTTPS preferred
+- HTTPS required
 - no request-body logging
 - upload size limits
 - bind to expected host/interface
@@ -517,46 +613,46 @@ This can later integrate with platforms such as Hermes Agent, MCP-compatible age
 - [x] Define core architecture
 - [x] Define safety boundary
 - [x] Define MVP behavior
-- [ ] Add ADRs for key security decisions
+- [x] Add ADRs for key security decisions
 
 ### Phase 1 — Python single-file prototype
 
-- [ ] Parse request schema JSON
-- [ ] Start local HTTP intake server
-- [ ] Generate one-time token
-- [ ] Render intake form
-- [ ] Accept env values and file uploads
-- [ ] Write `.env.local` with merge-only behavior
-- [ ] Write uploaded files under `secrets/`
-- [ ] Apply `0600` permissions
-- [ ] Generate redacted status JSON
-- [ ] Auto-shutdown after success or TTL
+- [x] Parse request schema JSON
+- [x] Start loopback-only HTTP intake server
+- [x] Generate one-time token
+- [x] Render intake form
+- [x] Accept declared env values and file content
+- [x] Write `.env.local` with merge-only behavior
+- [x] Write declared private files under allowlisted targets
+- [x] Apply POSIX `0600` or an explicit current-user Windows DACL
+- [x] Generate redacted status JSON
+- [x] Auto-shutdown after success or TTL
 
 ### Phase 2 — CLI package
 
-- [ ] `secretbox request create`
-- [ ] `secretbox serve`
-- [ ] `secretbox status`
-- [ ] `secretbox doctor`
-- [ ] installable Python package
-- [ ] tests for env merge and path policy
+- [x] `secretbox request create`
+- [x] `secretbox serve`
+- [x] `secretbox status`
+- [x] `secretbox doctor`
+- [x] installable Python package
+- [x] tests for request schema, env merge, path policy, server, and CLI
 
 ### Phase 3 — Agent integration
 
-- [ ] agent-facing request schema examples
-- [ ] Hermes skill integration
-- [ ] MCP server or tool wrapper
-- [ ] structured redacted result protocol
-- [ ] examples for common services: OpenAI, Anthropic, Supabase, Stripe, WeChat Pay
+- [x] agent-facing request schema examples
+- [x] Hermes skill integration
+- [x] MCP server or tool wrapper
+- [x] structured redacted result protocol
+- [x] examples for common services: OpenAI, Anthropic, Supabase, Stripe, WeChat Pay
 
 ### Phase 4 — Hardening
 
 - [ ] encrypted local request store
-- [ ] stronger browser security headers
-- [ ] CSRF protection
+- [x] restrictive browser security headers
+- [x] CSRF and loopback Host/Origin protection
 - [ ] upload MIME and extension policies
-- [ ] symlink safety
-- [ ] Windows permission behavior
+- [x] symlink and Windows reparse-point rejection
+- [x] Windows owner-only DACL behavior
 - [ ] remote HTTPS deployment guide
 - [ ] optional OS-user isolation guide
 
@@ -633,37 +729,32 @@ GOOGLE_APPLICATION_CREDENTIALS=./secrets/google-service-account.json
 
 ---
 
-## Possible repository structure
+## Repository structure
 
 ```text
 OpenAgent-secretbox/
-├── README.md
-├── SECURITY.md
-├── LICENSE
-├── pyproject.toml
-├── src/
-│   └── openagent_secretbox/
-│       ├── __init__.py
-│       ├── cli.py
-│       ├── server.py
-│       ├── schema.py
-│       ├── policy.py
-│       ├── env_writer.py
-│       ├── file_writer.py
-│       └── audit.py
-├── examples/
-│   ├── openai.request.json
-│   ├── supabase.request.json
-│   └── wechat-pay.request.json
-├── docs/
-│   ├── threat-model.md
-│   ├── request-schema.md
-│   └── decisions/
-│       └── ADR-001-local-first-secret-intake.md
-└── tests/
-    ├── test_env_writer.py
-    ├── test_policy.py
-    └── test_redaction.py
+|-- .github/workflows/ci.yml
+|-- README.md
+|-- SECURITY.md
+|-- pyproject.toml
+|-- uv.lock
+|-- schemas/request-v1.json
+|-- schemas/result-v1.json
+|-- src/openagent_secretbox/
+|   |-- cli.py
+|   |-- mcp_server.py
+|   |-- models.py
+|   |-- policy.py
+|   |-- protocol.py
+|   |-- redaction.py
+|   |-- schema.py
+|   |-- server.py
+|   |-- templates.py
+|   `-- writers.py
+|-- examples/
+|-- integrations/hermes/
+|-- docs/
+`-- tests/
 ```
 
 ---

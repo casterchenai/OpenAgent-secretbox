@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "request_id": "stripe-local-setup",
+  "title": "Stripe server API setup",
+  "workspace_root": "/path/to/project",
+  "needs": [
+    {
+      "type": "env",
+      "name": "STRIPE_SECRET_KEY",
+      "required": true,
+      "description": "Stripe server-side secret or restricted API key"
+    },
+    {
+      "type": "env",
+      "name": "STRIPE_WEBHOOK_SECRET",
+      "required": false,
+      "description": "Stripe webhook endpoint signing secret"
+    }
+  ],
+  "write_policy": {
+    "env_file": ".env.local",
+    "mode": "merge_only",
+    "no_overwrite": true,
+    "backup": false
+  }
+}

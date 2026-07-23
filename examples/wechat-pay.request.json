@@ -39,6 +39,6 @@
     "env_file": ".env.local",
     "mode": "merge_only",
     "no_overwrite": true,
-    "backup": true
+    "backup": false
   }
 }

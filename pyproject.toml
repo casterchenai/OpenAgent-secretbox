@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.25,<2"]
 build-backend = "hatchling.build"
 
 [project]
 name = "openagent-secretbox"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Secure secret intake for AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,15 +14,20 @@ authors = [
 ]
 keywords = ["ai-agent", "secrets", "env", "security", "credentials"]
 classifiers = [
-  "Development Status :: 1 - Planning",
+  "Development Status :: 2 - Pre-Alpha",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security",
   "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+  "pywin32>=311,<313; sys_platform == 'win32'"
 ]
 
 [project.urls]
@@ -30,8 +35,47 @@ Homepage = "https://github.com/casterchenai/OpenAgent-secretbox"
 Repository = "https://github.com/casterchenai/OpenAgent-secretbox"
 Issues = "https://github.com/casterchenai/OpenAgent-secretbox/issues"
 
+[project.optional-dependencies]
+mcp = [
+  "mcp>=1.27,<2"
+]
+dev = [
+  "build>=1.2,<2",
+  "jsonschema>=4.23,<5",
+  "mcp>=1.27,<2",
+  "mypy>=1.13,<2",
+  "pytest>=8,<9",
+  "ruff>=0.8,<1"
+]
+
 [project.scripts]
 secretbox = "openagent_secretbox.cli:main"
+secretbox-mcp = "openagent_secretbox.mcp_server:main"
+
+[tool.hatch.version]
+path = "src/openagent_secretbox/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/openagent_secretbox"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"schemas/request-v1.json" = "openagent_secretbox/schemas/request-v1.json"
+"schemas/result-v1.json" = "openagent_secretbox/schemas/result-v1.json"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/openagent_secretbox"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+filterwarnings = [
+  "error::pytest.PytestUnhandledThreadExceptionWarning"
+]

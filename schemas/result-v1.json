@@ -1,0 +1,813 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/casterchenai/OpenAgent-secretbox/schemas/result-v1.json",
+  "title": "OpenAgent SecretBox agent result",
+  "description": "Version 1 metadata-only writer results and CLI intake events. Secret-bearing fields are forbidden at every object level.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/writerResult"
+    },
+    {
+      "$ref": "#/$defs/intakeEvent"
+    },
+    {
+      "$ref": "#/$defs/mcpResult"
+    },
+    {
+      "$ref": "#/$defs/mcpError"
+    }
+  ],
+  "$defs": {
+    "safePropertyName": {
+      "type": "string",
+      "not": {
+        "pattern": "(?:[Ss][Ee][Cc][Rr][Ee][Tt]|[Vv][Aa][Ll][Uu][Ee]|[Bb][Oo][Dd][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]|[Rr][Aa][Ww]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Pp][Hh][Rr][Aa][Ss][Ee]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee][_-]?[Kk][Ee][Yy])"
+      }
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "metadataName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[^/\\\\\\u0000-\\u001F\\u007F]+$"
+    },
+    "target": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!.*[\\u0000-\\u001F\\u007F])(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)(?!.*:)(?!\\.$)(?!.*(?:^|/)(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.[^/]*|/|$))(?!.*[. ](?:/|$)).+$"
+    },
+    "writeAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "type",
+        "name",
+        "action",
+        "target"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "env",
+            "env_file",
+            "file"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/metadataName"
+        },
+        "action": {
+          "enum": [
+            "added",
+            "updated",
+            "created",
+            "skipped",
+            "permissions_repaired"
+          ]
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "mode": {
+          "enum": [
+            "0600",
+            "owner-only"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "env"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "added",
+                  "updated",
+                  "skipped"
+                ]
+              },
+              "mode": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "env_file"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "action": {
+                "const": "permissions_repaired"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "file"
+              },
+              "action": {
+                "enum": [
+                  "created",
+                  "updated",
+                  "permissions_repaired"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "action"
+            ]
+          },
+          "then": {
+            "required": [
+              "mode"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "file"
+              },
+              "action": {
+                "const": "skipped"
+              }
+            },
+            "required": [
+              "type",
+              "action"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mode": false
+            }
+          }
+        }
+      ]
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "type",
+        "name",
+        "action",
+        "target"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "env",
+            "file"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/metadataName"
+        },
+        "action": {
+          "const": "conflict"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      }
+    },
+    "blockedReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request_or_workspace",
+            "invalid_values",
+            "apply_failed"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/metadataName"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        }
+      }
+    },
+    "writerResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "request_id",
+        "status",
+        "written",
+        "conflicts",
+        "missing",
+        "blocked"
+      ],
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "status": {
+          "enum": [
+            "applied",
+            "noop",
+            "partial",
+            "blocked"
+          ]
+        },
+        "written": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/writeAction"
+          }
+        },
+        "conflicts": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/conflict"
+          }
+        },
+        "missing": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/metadataName"
+          }
+        },
+        "blocked": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/blockedReason"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "applied"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "written": {
+                "minItems": 1
+              },
+              "conflicts": {
+                "maxItems": 0
+              },
+              "missing": {
+                "maxItems": 0
+              },
+              "blocked": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "noop"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "conflicts": {
+                "maxItems": 0
+              },
+              "missing": {
+                "maxItems": 0
+              },
+              "blocked": {
+                "maxItems": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "partial"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "written": {
+                "minItems": 1
+              },
+              "missing": {
+                "maxItems": 0
+              }
+            },
+            "anyOf": [
+              {
+                "properties": {
+                  "conflicts": {
+                    "minItems": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "blocked": {
+                    "minItems": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "blocked"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "written": {
+                "maxItems": 0
+              }
+            },
+            "anyOf": [
+              {
+                "properties": {
+                  "conflicts": {
+                    "minItems": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "missing": {
+                    "minItems": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "blocked": {
+                    "minItems": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "intakeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "schema_version",
+        "status",
+        "request_id",
+        "browser_opened"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "status": {
+          "enum": [
+            "awaiting_input",
+            "applied",
+            "failed",
+            "cancelled",
+            "expired"
+          ]
+        },
+        "request_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "browser_opened": {
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/$defs/writerResult"
+        },
+        "error_code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "awaiting_input"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "browser_opened": {
+                "const": true
+              },
+              "result": false,
+              "error_code": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "applied"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "result"
+            ],
+            "properties": {
+              "error_code": false,
+              "result": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/writerResult"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "applied",
+                          "noop"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error_code"
+            ],
+            "properties": {
+              "result": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/writerResult"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "partial",
+                          "blocked"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "result": false,
+              "error_code": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "expired"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error_code"
+            ],
+            "properties": {
+              "result": false,
+              "error_code": {
+                "const": "expired"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "mcpResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "schema_version",
+        "intake_id",
+        "request_id",
+        "status"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "intake_id": {
+          "type": "string",
+          "pattern": "^int_[A-Za-z0-9_-]{16,64}$"
+        },
+        "request_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "status": {
+          "enum": [
+            "awaiting_input",
+            "applied",
+            "failed",
+            "cancelled",
+            "expired"
+          ]
+        },
+        "expires_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "browser_opened": {
+          "type": "boolean"
+        },
+        "result": {
+          "$ref": "#/$defs/writerResult"
+        },
+        "error_code": {
+          "enum": [
+            "apply_blocked",
+            "apply_failed",
+            "expired"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "awaiting_input"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "expires_at"
+            ],
+            "properties": {
+              "browser_opened": {
+                "const": true
+              },
+              "result": false,
+              "error_code": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "applied"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "result"
+            ],
+            "properties": {
+              "browser_opened": false,
+              "error_code": false,
+              "result": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/writerResult"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "applied",
+                          "noop"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error_code"
+            ],
+            "properties": {
+              "browser_opened": false,
+              "result": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/writerResult"
+                  },
+                  {
+                    "properties": {
+                      "status": {
+                        "enum": [
+                          "partial",
+                          "blocked"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "browser_opened": false,
+              "result": false,
+              "error_code": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "expired"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "error_code"
+            ],
+            "properties": {
+              "browser_opened": false,
+              "result": false,
+              "error_code": {
+                "const": "expired"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "mcpError": {
+      "type": "object",
+      "additionalProperties": false,
+      "propertyNames": {
+        "$ref": "#/$defs/safePropertyName"
+      },
+      "required": [
+        "schema_version",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "status": {
+          "const": "error"
+        },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "propertyNames": {
+            "$ref": "#/$defs/safePropertyName"
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_ttl",
+                "invalid_request",
+                "policy_rejected",
+                "server_closed",
+                "too_many_active_intakes",
+                "browser_open_failed",
+                "server_unavailable",
+                "intake_not_found",
+                "status_unavailable",
+                "apply_in_progress"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300,
+              "pattern": "^(?!.*(?:[Hh][Tt][Tt][Pp][Ss]?://|/[Ii][Nn][Tt][Aa][Kk][Ee]/|#[Tt][Oo][Kk][Ee][Nn]=|[Ss][Ee][Ss]_))[^\\u0000-\\u001F\\u007F]+$"
+            }
+          }
+        }
+      }
+    }
+  }
+}

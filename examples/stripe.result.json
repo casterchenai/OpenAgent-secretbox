@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "failed",
+  "request_id": "stripe-local-setup",
+  "browser_opened": true,
+  "error_code": "apply_blocked",
+  "result": {
+    "request_id": "stripe-local-setup",
+    "status": "blocked",
+    "written": [],
+    "conflicts": [
+      {
+        "type": "env",
+        "name": "STRIPE_SECRET_KEY",
+        "action": "conflict",
+        "target": ".env.local"
+      }
+    ],
+    "missing": [],
+    "blocked": []
+  }
+}
