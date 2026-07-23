@@ -230,9 +230,21 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
       <p>请求已经完成，可以关闭此页面并返回 AI 对话继续操作。</p>
       <p>此链接已经失效；刷新或再次打开不会重新显示表单。</p>
     </section>
+    <section id="apply-failed" class="state-panel error-panel" tabindex="-1" hidden>
+      <h2>保存未完成，此页面无法重试</h2>
+      <p>SecretBox 未能确认所有凭据均已保存；部分目标可能已经写入。为保护凭据，
+        此次一次性会话已经结束，表单将保持锁定。</p>
+      <p><strong>请返回 AI 对话，说明保存失败并要求生成新的 SecretBox 链接。</strong></p>
+    </section>
     <section id="cancelled" class="state-panel" tabindex="-1" hidden>
       <h2>已取消</h2>
       <p>没有提交任何内容。若需要重新填写，请返回 AI 对话索取新链接。</p>
+    </section>
+    <section id="cancel-uncertain" class="state-panel error-panel" tabindex="-1" hidden>
+      <h2>无法确认取消结果</h2>
+      <p>取消请求已经发出，但 SecretBox 未收到可确认的响应。为避免重复操作，
+        此页面不会再次启用。</p>
+      <p><strong>请返回 AI 对话查询当前状态；如需继续，请要求生成新的 SecretBox 链接。</strong></p>
     </section>
   </main>
   <script nonce="{escaped_nonce}">
@@ -245,7 +257,9 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
     const context = document.getElementById('request-context');
     const unavailable = document.getElementById('unavailable');
     const success = document.getElementById('success');
+    const applyFailed = document.getElementById('apply-failed');
     const cancelled = document.getElementById('cancelled');
+    const cancelUncertain = document.getElementById('cancel-uncertain');
     const visibilityButtons = Array.from(form.querySelectorAll('.visibility-toggle'));
     const controls = Array.from(form.querySelectorAll('input, textarea, button'));
     const setReady = (ready) => {{
@@ -254,7 +268,7 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
     }};
     const sessionId = form.dataset.sessionId;
     const storageKey = 'secretbox-session:' + sessionId;
-    const token = new URLSearchParams(window.location.hash.slice(1)).get('token');
+    let token = new URLSearchParams(window.location.hash.slice(1)).get('token');
     window.history.replaceState(null, '', window.location.pathname);
     let session = null;
     const say = (message, ok) => {{ status.textContent = message;
@@ -263,10 +277,22 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
       form.hidden = true; notice.hidden = true; context.hidden = true; status.hidden = true;
       panel.hidden = false; panel.focus();
     }};
-    const showUnavailable = () => {{
-      sessionStorage.removeItem(storageKey);
-      showFinalState(unavailable);
+    const clearLocalSession = () => {{
+      try {{ sessionStorage.removeItem(storageKey); }} catch (_) {{ /* best effort */ }}
+      session = null;
+      token = null;
     }};
+    const clearSecretInputs = () => form.querySelectorAll('[data-secret-name]')
+      .forEach((input) => {{ input.value = ''; }});
+    const showTerminalState = (panel) => {{
+      setReady(false);
+      clearSecretInputs();
+      clearLocalSession();
+      showFinalState(panel);
+    }};
+    const showUnavailable = () => showTerminalState(unavailable);
+    const showTerminalFailure = () => showTerminalState(applyFailed);
+    const showCancelUncertain = () => showTerminalState(cancelUncertain);
     const setSecretVisible = (toggle, input, visible) => {{
       input.type = visible ? 'text' : 'password';
       toggle.setAttribute('aria-pressed', String(visible));
@@ -303,7 +329,7 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
       const restored = JSON.parse(sessionStorage.getItem(storageKey) || 'null');
       if (restored?.session_id === sessionId && restored?.csrf_token &&
           restored?.expires_at > Date.now() / 1000) {{
-        session = restored; setReady(true);
+        session = restored; token = null; setReady(true);
         say('安全会话已就绪，可以填写并上传文件。请勿刷新页面。', true);
       }} else {{
         sessionStorage.removeItem(storageKey);
@@ -319,6 +345,7 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
         .then((body) => {{
           session = {{ session_id: body.session_id, csrf_token: body.csrf_token,
             expires_at: body.expires_at }};
+          token = null;
           sessionStorage.setItem(storageKey, JSON.stringify(session));
           setReady(true);
           say('安全会话已就绪，可以填写并上传文件。请勿刷新页面。', true);
@@ -331,6 +358,7 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
       maskAllSecrets();
       setReady(false); say('正在安全写入，请勿关闭页面...', true);
       const values = {{ env: {{}}, files: {{}} }};
+      let submissionDispatched = false;
       try {{
         for (const input of form.querySelectorAll('[data-secret-name]')) {{
           const name = input.dataset.secretName;
@@ -342,6 +370,7 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
             values.files[name] = {{ filename: file.name, content_base64: btoa(binary) }};
           }} else if (input.value) values.env[name] = input.value;
         }}
+        submissionDispatched = true;
         const applied = await fetch(
           '/api/sessions/' + encodeURIComponent(session.session_id) + '/submit', {{
           method: 'POST', headers: {{ 'Content-Type': 'application/json',
@@ -349,11 +378,12 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
           body: JSON.stringify({{ values }})
         }}).then(json);
         if (applied.status !== 'applied') {{
-          throw new Error('The request could not be fully applied. No success was reported.');
+          showTerminalFailure();
+          return;
         }}
-        sessionStorage.removeItem(storageKey);
-        showFinalState(success);
+        showTerminalState(success);
       }} catch (error) {{
+        if (submissionDispatched) {{ showTerminalFailure(); return; }}
         button.textContent = '安全保存';
         say(error.message || '保存失败，请检查输入后重试。', false);
         setReady(true);
@@ -370,11 +400,9 @@ def render_intake(request: Mapping[str, Any], nonce: str, session_id: str) -> st
             'Accept': 'application/json', 'X-CSRF-Token': session.csrf_token }},
           body: '{{}}'
         }}).then(json);
-        sessionStorage.removeItem(storageKey);
-        showFinalState(cancelled);
+        showTerminalState(cancelled);
       }} catch (error) {{
-        say(error.message || '取消失败，请重试。', false);
-        setReady(true);
+        showCancelUncertain();
       }}
     }});
   }})();

@@ -20,12 +20,13 @@ import time
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from socketserver import ThreadingMixIn
 from typing import Any
 from urllib.parse import unquote
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
+from .protocol import normalize_writer_result
 from .schema import (
     load_request as _schema_load_request,
 )
@@ -41,6 +42,9 @@ CSRF_BYTES = 32
 COOKIE_BYTES = 24
 REQUEST_READ_TIMEOUT_SECONDS = 1.0
 _RESULT_STATUSES = frozenset({"applied", "noop", "blocked", "partial", "failed"})
+_WRITER_RESULT_FIELDS = frozenset(
+    {"request_id", "status", "written", "conflicts", "missing", "blocked"}
+)
 
 
 class SessionError(Exception):
@@ -251,6 +255,53 @@ def _collect_secret_literals(value: Any) -> tuple[str, ...]:
     # Replacing longer values first prevents a short value from hiding part of a
     # longer credential and leaving the rest visible.
     return tuple(sorted(found, key=len, reverse=True))
+
+
+def _ensure_writer_metadata_is_public(
+    result: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> None:
+    """Require every free metadata value to be independently declared by the request."""
+
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or result["request_id"] != request_id:
+        raise ValueError("writer result request_id does not match the request")
+
+    public_names: set[str] = set()
+    public_targets: set[str] = set()
+    needs = request.get("needs")
+    if isinstance(needs, Sequence) and not isinstance(needs, (str, bytes, bytearray)):
+        for need in needs:
+            if not isinstance(need, Mapping):
+                continue
+            name = need.get("name")
+            target = need.get("target")
+            if isinstance(name, str):
+                public_names.add(name)
+            if isinstance(target, str):
+                public_targets.add(target)
+    policy = request.get("write_policy")
+    if isinstance(policy, Mapping):
+        env_file = policy.get("env_file")
+        if isinstance(env_file, str):
+            public_targets.add(env_file)
+    public_names.update(PurePosixPath(target).name for target in public_targets)
+
+    def ensure_public(value: str, allowed: set[str]) -> None:
+        if value not in allowed:
+            raise ValueError("writer metadata is not declared by the request")
+
+    ensure_public(result["request_id"], {request_id})
+    for entry in (*result["written"], *result["conflicts"]):
+        ensure_public(entry["name"], public_names)
+        ensure_public(entry["target"], public_targets)
+    for name in result["missing"]:
+        ensure_public(name, public_names)
+    for entry in result["blocked"]:
+        if "name" in entry:
+            ensure_public(entry["name"], public_names)
+        if "target" in entry:
+            ensure_public(entry["target"], public_targets)
 
 
 class SessionStore:
@@ -489,26 +540,38 @@ class SessionStore:
         # transactional write synchronously and return only redacted metadata.
         try:
             result = _invoke_apply(apply_fn, request, values)
-            raw_status = result.get("status") if isinstance(result, Mapping) else None
-            reported_status = (
-                raw_status
-                if isinstance(raw_status, str) and raw_status in _RESULT_STATUSES
-                else "failed"
-            )
-            redaction_source = (
-                {key: item for key, item in result.items() if key != "status"}
-                if isinstance(result, Mapping)
-                else result
-            )
-            redacted_details = _redact_result(
-                redaction_source,
-                secret_literals=_collect_secret_literals(values),
-            )
-            redacted = (
-                {"status": reported_status, **redacted_details}
-                if isinstance(redacted_details, Mapping)
-                else {"status": reported_status, "details": redacted_details}
-            )
+            if isinstance(result, Mapping) and _WRITER_RESULT_FIELDS <= set(result):
+                # Closed writer results contain only public protocol metadata.  Do
+                # not scrub submitted literals across enum/name/target fields: an
+                # equal secret value is a coincidence, not secret-derived output.
+                # Normalization rejects extensions before the result is retained.
+                redacted = normalize_writer_result(result)
+                _ensure_writer_metadata_is_public(
+                    redacted,
+                    request,
+                )
+                reported_status = redacted["status"]
+            else:
+                raw_status = result.get("status") if isinstance(result, Mapping) else None
+                reported_status = (
+                    raw_status
+                    if isinstance(raw_status, str) and raw_status in _RESULT_STATUSES
+                    else "failed"
+                )
+                redaction_source = (
+                    {key: item for key, item in result.items() if key != "status"}
+                    if isinstance(result, Mapping)
+                    else result
+                )
+                redacted_details = _redact_result(
+                    redaction_source,
+                    secret_literals=_collect_secret_literals(values),
+                )
+                redacted = (
+                    {"status": reported_status, **redacted_details}
+                    if isinstance(redacted_details, Mapping)
+                    else {"status": reported_status, "details": redacted_details}
+                )
         except Exception as exc:
             with self._lock:
                 session.state = "failed"

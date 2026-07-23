@@ -122,6 +122,45 @@ def test_real_apply_request_applied_noop_and_blocked_match_protocol(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
+    "secret",
+    [
+        "anthropic-local-setup",
+        "applied",
+        "env",
+        "ANTHROPIC_API_KEY",
+        "added",
+        ".env.local",
+    ],
+)
+def test_secret_equal_to_writer_metadata_does_not_corrupt_protocol(
+    tmp_path: Path, secret: str
+) -> None:
+    request_document = json.loads(REQUEST_EXAMPLES[0].read_text(encoding="utf-8"))
+    request_document["workspace_root"] = str(tmp_path)
+    request = validate_request(request_document, workspace_root=tmp_path)
+
+    result = apply_request(request, {"ANTHROPIC_API_KEY": secret}, tmp_path)
+
+    assert result == {
+        "request_id": "anthropic-local-setup",
+        "status": "applied",
+        "written": [
+            {
+                "type": "env",
+                "name": "ANTHROPIC_API_KEY",
+                "action": "added",
+                "target": ".env.local",
+            }
+        ],
+        "conflicts": [],
+        "missing": [],
+        "blocked": [],
+    }
+    RESULT_VALIDATOR.validate(result)
+    assert normalize_agent_result(result) == result
+
+
+@pytest.mark.parametrize(
     "event",
     [
         {

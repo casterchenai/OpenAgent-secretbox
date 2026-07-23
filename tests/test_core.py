@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -18,6 +18,14 @@ from openagent_secretbox.writers import (
     merge_env_text,
     write_private_file,
 )
+
+
+def _trusted_windows_test_executable(*parts: str) -> str:
+    return str(PureWindowsPath("C:/Windows/System32", *parts))
+
+
+def _trusted_windows_test_environment(extra: dict[str, str]) -> dict[str, str]:
+    return {"SystemRoot": r"C:\Windows", **extra}
 
 
 def request_for(workspace: Path) -> dict:
@@ -196,7 +204,7 @@ def test_identical_windows_target_repairs_acl_and_then_noops(tmp_path: Path) -> 
     target = tmp_path / "private.pem"
     target.write_bytes(b"same")
     subprocess.run(
-        ["icacls", str(target), "/grant", "*S-1-1-0:(R)"],
+        [writers._windows_system_executable("icacls.exe"), str(target), "/grant", "*S-1-1-0:(R)"],
         check=True,
         capture_output=True,
         text=True,
@@ -247,36 +255,235 @@ def test_identical_targets_fail_closed_when_permissions_cannot_be_secured(
         write_private_file(file_target, b"same")
 
 
-@pytest.mark.parametrize(("stdout", "changed"), [("true", True), ("false", False)])
-def test_windows_acl_command_reports_whether_it_changed_permissions(
+def test_temp_file_identity_change_is_rejected_before_secret_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(writers, "_set_owner_only", lambda *_args: None)
+    monkeypatch.setattr(writers, "_same_file_identity", lambda *_args: False)
+
+    with pytest.raises(WriteError, match="temporary target changed"):
+        writers._write_temp_file(tmp_path, ".secretbox-test-", b"must-not-be-written")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_windows_acl_check_reports_secure_target_without_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    stdout: str,
-    changed: bool,
 ) -> None:
     target = tmp_path / "private.pem"
     seen: dict[str, object] = {}
+    sid = "S-1-5-21-test"
+    snapshot = json.dumps(
+        {
+            "owner": sid,
+            "protected": True,
+            "rules": [{"sid": sid, "allow": True, "full_control": True}],
+        }
+    )
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         seen["command"] = command
         seen["environment"] = kwargs["env"]
-        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=snapshot, stderr="")
 
-    monkeypatch.setattr(writers, "_windows_current_sid", lambda: "S-1-5-21-test")
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
+    monkeypatch.setattr(
+        writers, "_windows_system_executable", _trusted_windows_test_executable
+    )
+    monkeypatch.setattr(
+        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+    )
     monkeypatch.setattr(writers.subprocess, "run", fake_run)
 
-    assert writers._set_windows_owner_only(target) is changed
+    assert writers._set_windows_owner_only(target) is False
     assert seen["command"] == [
-        "powershell.exe",
+        _trusted_windows_test_executable("WindowsPowerShell", "v1.0", "powershell.exe"),
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        writers._WINDOWS_OWNER_ONLY_SCRIPT,
+        writers._WINDOWS_ACL_INSPECT_SCRIPT,
     ]
     environment = seen["environment"]
     assert isinstance(environment, dict)
     assert environment["OPENAGENT_SECRETBOX_ACL_PATH"] == str(target)
-    assert environment["OPENAGENT_SECRETBOX_ACL_SID"] == "S-1-5-21-test"
+
+
+def test_windows_acl_repair_uses_icacls_and_verifies_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private.pem"
+    sid = "S-1-5-21-test"
+    other_sid = "S-1-1-0"
+    snapshots = iter(
+        [
+            json.dumps(
+                {
+                    "owner": sid,
+                    "protected": False,
+                    "rules": [
+                        {"sid": other_sid, "allow": True, "full_control": False},
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "owner": sid,
+                    "protected": True,
+                    "rules": [{"sid": sid, "allow": True, "full_control": True}],
+                }
+            ),
+        ]
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        powershell = _trusted_windows_test_executable(
+            "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        stdout = next(snapshots) if command[0] == powershell else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
+    monkeypatch.setattr(
+        writers, "_windows_system_executable", _trusted_windows_test_executable
+    )
+    monkeypatch.setattr(
+        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+    )
+    monkeypatch.setattr(writers.subprocess, "run", fake_run)
+
+    assert writers._set_windows_owner_only(target) is True
+    powershell = _trusted_windows_test_executable(
+        "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    icacls = _trusted_windows_test_executable("icacls.exe")
+    assert commands == [
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            writers._WINDOWS_ACL_INSPECT_SCRIPT,
+        ],
+        [icacls, str(target), "/grant:r", f"*{sid}:(F)"],
+        [icacls, str(target), "/remove:d", f"*{sid}"],
+        [icacls, str(target), "/grant:r", f"*{sid}:(F)"],
+        [icacls, str(target), "/setowner", f"*{sid}"],
+        [icacls, str(target), "/inheritance:r"],
+        [icacls, str(target), "/remove", f"*{other_sid}"],
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            writers._WINDOWS_ACL_INSPECT_SCRIPT,
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["not-json", '{"owner":"S-1-5-21-test","protected":true,"rules":{}}'],
+)
+def test_windows_acl_inspection_rejects_unexpected_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+) -> None:
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: "S-1-5-21-test")
+    monkeypatch.setattr(
+        writers, "_windows_system_executable", _trusted_windows_test_executable
+    )
+    monkeypatch.setattr(
+        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+    )
+    monkeypatch.setattr(writers.subprocess, "run", fake_run)
+
+    with pytest.raises(WriteError, match="unable to inspect Windows permissions"):
+        writers._set_windows_owner_only(tmp_path / "private.pem")
+
+
+def test_windows_acl_command_failure_is_fail_closed_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-test"
+    insecure = json.dumps(
+        {
+            "owner": sid,
+            "protected": False,
+            "rules": [{"sid": "S-1-1-0", "allow": True, "full_control": False}],
+        }
+    )
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        powershell = _trusted_windows_test_executable(
+            "WindowsPowerShell", "v1.0", "powershell.exe"
+        )
+        if command[0] == powershell:
+            return subprocess.CompletedProcess(command, 0, stdout=insecure, stderr="")
+        return subprocess.CompletedProcess(
+            command,
+            5,
+            stdout="",
+            stderr="sensitive-diagnostic-must-not-escape",
+        )
+
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
+    monkeypatch.setattr(
+        writers, "_windows_system_executable", _trusted_windows_test_executable
+    )
+    monkeypatch.setattr(
+        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+    )
+    monkeypatch.setattr(writers.subprocess, "run", fake_run)
+
+    with pytest.raises(WriteError, match="unable to set owner-only") as raised:
+        writers._set_windows_owner_only(tmp_path / "private.pem")
+    assert "sensitive-diagnostic" not in str(raised.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable resolution test")
+def test_windows_system_executables_ignore_workspace_shadows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("whoami.exe", "icacls.exe", "powershell.exe"):
+        (tmp_path / name).write_bytes(b"workspace-shadow")
+    fake_root = tmp_path / "fake-windows"
+    fake_system = fake_root / "System32"
+    fake_powershell = fake_system / "WindowsPowerShell" / "v1.0"
+    fake_powershell.mkdir(parents=True)
+    for path in (
+        fake_system / "whoami.exe",
+        fake_system / "icacls.exe",
+        fake_powershell / "powershell.exe",
+    ):
+        path.write_bytes(b"environment-shadow")
+    monkeypatch.setenv("SystemRoot", str(fake_root))
+    monkeypatch.setenv("WINDIR", str(fake_root))
+    monkeypatch.chdir(tmp_path)
+    writers._windows_system_directory.cache_clear()
+    writers._windows_system_executable.cache_clear()
+
+    resolved = [
+        Path(writers._windows_system_executable("whoami.exe")),
+        Path(writers._windows_system_executable("icacls.exe")),
+        Path(
+            writers._windows_system_executable(
+                "WindowsPowerShell", "v1.0", "powershell.exe"
+            )
+        ),
+    ]
+
+    assert all(path.is_absolute() and path.is_file() for path in resolved)
+    assert all(path.parent != tmp_path for path in resolved)
+    assert all(not path.is_relative_to(fake_root) for path in resolved)
 
 
 def test_apply_request_never_returns_secret(tmp_path: Path) -> None:
@@ -293,6 +500,32 @@ def test_short_secret_does_not_corrupt_protocol_status(tmp_path: Path, secret: s
 
     assert result["status"] == "applied"
     assert (tmp_path / ".env.local").read_text(encoding="utf-8") == f"API_KEY={secret}\n"
+
+
+def test_env_block_results_use_only_the_declared_request_name(tmp_path: Path) -> None:
+    request = request_for(tmp_path)
+    request["needs"] = [
+        {"type": "env_file", "name": "ENV_BLOCK", "required": True}
+    ]
+
+    result = apply_request(
+        request,
+        {"ENV_BLOCK": "SECRET_FIRST=one\nSECRET_SECOND=two"},
+        tmp_path,
+    )
+
+    assert result["status"] == "applied"
+    assert result["written"] == [
+        {
+            "type": "env",
+            "name": "ENV_BLOCK",
+            "action": "added",
+            "target": ".env.local",
+        }
+    ]
+    encoded = json.dumps(result)
+    assert "SECRET_FIRST" not in encoded
+    assert "SECRET_SECOND" not in encoded
 
 
 def test_multi_target_failure_is_reported_as_partial(tmp_path: Path) -> None:

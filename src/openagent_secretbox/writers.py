@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import ctypes
+import json
 import os
 import re
 import stat
@@ -13,11 +15,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from .models import SecretRequest
 from .policy import PathPolicy, PolicyError, build_policy, ensure_safe_parent
-from .redaction import redact_result, safe_status
+from .protocol import normalize_writer_result
+from .redaction import safe_status
 from .schema import RequestValidationError, validate_request
 
 
@@ -38,65 +41,215 @@ _ENV_LINE_RE = re.compile(r"^(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]{0,127})[ \t
 _REPARSE_POINT = 0x0400
 DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024
 
-_WINDOWS_OWNER_ONLY_SCRIPT = r"""
+_WINDOWS_ACL_INSPECT_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $Path = [Environment]::GetEnvironmentVariable(
   'OPENAGENT_SECRETBOX_ACL_PATH', 'Process'
 )
-$Sid = [Environment]::GetEnvironmentVariable(
-  'OPENAGENT_SECRETBOX_ACL_SID', 'Process'
-)
-function Test-OwnerOnly(
-  [System.Security.AccessControl.FileSecurity]$Acl,
-  [string]$ExpectedSid
-) {
-  $rules = @($Acl.Access)
-  $ownerSid = $Acl.GetOwner(
-    [System.Security.Principal.SecurityIdentifier]
-  ).Value
-  if (
-    $ownerSid -ne $ExpectedSid -or
-    -not $Acl.AreAccessRulesProtected -or
-    $rules.Count -ne 1
-  ) {
-    return $false
-  }
-  $ruleSid = $rules[0].IdentityReference.Translate(
-    [System.Security.Principal.SecurityIdentifier]
-  ).Value
-  return (
-    $ruleSid -eq $ExpectedSid -and
-    $rules[0].AccessControlType -eq
-      [System.Security.AccessControl.AccessControlType]::Allow -and
-    ($rules[0].FileSystemRights -band
-      [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
-      [System.Security.AccessControl.FileSystemRights]::FullControl
-  )
-}
 $acl = Get-Acl -LiteralPath $Path
-if (Test-OwnerOnly $acl $Sid) {
-  [Console]::Out.Write('false')
-  exit 0
-}
-$identity = [System.Security.Principal.SecurityIdentifier]::new($Sid)
-$acl.SetOwner($identity)
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) {
-  [void]$acl.RemoveAccessRuleSpecific($rule)
-}
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-  $identity,
-  [System.Security.AccessControl.FileSystemRights]::FullControl,
-  [System.Security.AccessControl.AccessControlType]::Allow
+$ownerSid = $acl.GetOwner(
+  [System.Security.Principal.SecurityIdentifier]
+).Value
+$rules = @(
+  foreach ($rule in @($acl.Access)) {
+    $ruleSid = $rule.IdentityReference.Translate(
+      [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    [PSCustomObject]@{
+      'sid' = $ruleSid
+      'allow' = [bool](
+        $rule.AccessControlType -eq
+          [System.Security.AccessControl.AccessControlType]::Allow
+      )
+      'full_control' = [bool](
+        ($rule.FileSystemRights -band
+          [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+          [System.Security.AccessControl.FileSystemRights]::FullControl
+      )
+    }
+  }
 )
-[void]$acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $Path -AclObject $acl
-$verified = Get-Acl -LiteralPath $Path
-if (-not (Test-OwnerOnly $verified $Sid)) {
-  throw 'ACL verification failed'
-}
-[Console]::Out.Write('true')
+[PSCustomObject]@{
+  'owner' = $ownerSid
+  'protected' = [bool]$acl.AreAccessRulesProtected
+  'rules' = $rules
+} | ConvertTo-Json -Compress -Depth 3
 """
+
+
+@lru_cache(maxsize=1)
+def _windows_system_directory() -> Path:
+    """Return the real System32 directory without trusting process environment state."""
+
+    if os.name != "nt":
+        raise WriteError("unable to locate a trusted Windows system executable")
+    try:
+        win_dll = ctypes.__dict__.get("WinDLL")
+        if not callable(win_dll):
+            raise OSError("WinDLL is unavailable")
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        get_system_directory = kernel32.GetSystemDirectoryW
+        get_system_directory.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+        get_system_directory.restype = ctypes.c_uint
+        buffer = ctypes.create_unicode_buffer(32_768)
+        length = int(get_system_directory(buffer, len(buffer)))
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise WriteError("unable to locate a trusted Windows system executable") from exc
+    if length <= 0 or length >= len(buffer):
+        raise WriteError("unable to locate a trusted Windows system executable")
+    try:
+        directory = Path(buffer.value).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise WriteError("unable to locate a trusted Windows system executable") from exc
+    if not directory.is_absolute() or not directory.is_dir():
+        raise WriteError("unable to locate a trusted Windows system executable")
+    return directory
+
+
+@lru_cache(maxsize=8)
+def _windows_system_executable(*relative_parts: str) -> str:
+    """Resolve a trusted Windows binary without searching the workspace or PATH."""
+
+    root = _windows_system_directory()
+    try:
+        candidate = root.joinpath(*relative_parts).resolve(strict=True)
+        candidate.relative_to(root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise WriteError("unable to locate a trusted Windows system executable") from exc
+    if not candidate.is_file():
+        raise WriteError("unable to locate a trusted Windows system executable")
+    return str(candidate)
+
+
+def _windows_powershell_environment(extra: Mapping[str, str]) -> dict[str, str]:
+    system_directory = _windows_system_directory()
+    windows_directory = system_directory.parent
+    environment = {
+        "SystemRoot": str(windows_directory),
+        "WINDIR": str(windows_directory),
+        "ComSpec": str(system_directory / "cmd.exe"),
+        "PATH": str(system_directory),
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "PSModulePath": str(system_directory / "WindowsPowerShell" / "v1.0" / "Modules"),
+    }
+    environment.update(extra)
+    return environment
+
+
+def _parse_windows_acl_snapshot(value: str) -> tuple[str, bool, tuple[tuple[str, bool, bool], ...]]:
+    try:
+        payload = json.loads(value)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise WriteError("unable to inspect Windows permissions") from exc
+    if not isinstance(payload, dict):
+        raise WriteError("unable to inspect Windows permissions")
+    owner = payload.get("owner")
+    protected = payload.get("protected")
+    raw_rules = payload.get("rules")
+    if not isinstance(owner, str) or not owner.startswith("S-"):
+        raise WriteError("unable to inspect Windows permissions")
+    if not isinstance(protected, bool) or not isinstance(raw_rules, list):
+        raise WriteError("unable to inspect Windows permissions")
+    rules: list[tuple[str, bool, bool]] = []
+    for raw_rule in raw_rules:
+        if not isinstance(raw_rule, dict):
+            raise WriteError("unable to inspect Windows permissions")
+        sid = raw_rule.get("sid")
+        allow = raw_rule.get("allow")
+        full_control = raw_rule.get("full_control")
+        if (
+            not isinstance(sid, str)
+            or not sid.startswith("S-")
+            or not isinstance(allow, bool)
+            or not isinstance(full_control, bool)
+        ):
+            raise WriteError("unable to inspect Windows permissions")
+        rules.append((sid, allow, full_control))
+    return owner, protected, tuple(rules)
+
+
+def _inspect_windows_acl(
+    path: Path,
+    *,
+    environment: Mapping[str, str],
+) -> tuple[str, bool, tuple[tuple[str, bool, bool], ...]]:
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    powershell = _windows_system_executable(
+        "WindowsPowerShell", "v1.0", "powershell.exe"
+    )
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                _WINDOWS_ACL_INSPECT_SCRIPT,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=creation_flags,
+            env=environment,
+            cwd=str(Path(powershell).parent),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WriteError("unable to inspect Windows permissions") from exc
+    if result.returncode != 0:
+        raise WriteError("unable to inspect Windows permissions")
+    return _parse_windows_acl_snapshot(result.stdout.strip())
+
+
+def _run_icacls(path: Path, *arguments: str) -> None:
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        result = subprocess.run(
+            [_windows_system_executable("icacls.exe"), str(path), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=creation_flags,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WriteError("unable to set owner-only Windows permissions") from exc
+    if result.returncode != 0:
+        raise WriteError("unable to set owner-only Windows permissions")
+
+
+def _windows_acl_is_owner_only(
+    snapshot: tuple[str, bool, tuple[tuple[str, bool, bool], ...]],
+    sid: str,
+) -> bool:
+    owner, protected, rules = snapshot
+    return owner == sid and protected and rules == ((sid, True, True),)
+
+
+def _set_windows_owner_only(path: Path) -> bool:
+    sid = _windows_current_sid()
+    environment = _windows_powershell_environment(
+        {"OPENAGENT_SECRETBOX_ACL_PATH": str(path)}
+    )
+    before = _inspect_windows_acl(path, environment=environment)
+    if _windows_acl_is_owner_only(before, sid):
+        return False
+
+    sid_argument = f"*{sid}"
+    # Every mutation is monotonic: first guarantee the current user retains
+    # control, then remove inheritance and all other observed principals.
+    _run_icacls(path, "/grant:r", f"{sid_argument}:(F)")
+    _run_icacls(path, "/remove:d", sid_argument)
+    _run_icacls(path, "/grant:r", f"{sid_argument}:(F)")
+    _run_icacls(path, "/setowner", sid_argument)
+    _run_icacls(path, "/inheritance:r")
+    for rule_sid in sorted({rule[0] for rule in before[2]} - {sid}):
+        _run_icacls(path, "/remove", f"*{rule_sid}")
+
+    verified = _inspect_windows_acl(path, environment=environment)
+    if not _windows_acl_is_owner_only(verified, sid):
+        raise WriteError("unable to verify owner-only Windows permissions")
+    return True
 
 
 @dataclass(frozen=True)
@@ -334,7 +487,7 @@ def _windows_current_sid() -> str:
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         result = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
+            [_windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
             check=True,
             capture_output=True,
             text=True,
@@ -350,35 +503,6 @@ def _windows_current_sid() -> str:
     if len(fields) < 2 or not fields[1].startswith("S-"):
         raise WriteError("unable to identify the current Windows user")
     return fields[1]
-
-
-def _set_windows_owner_only(path: Path) -> bool:
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    environment = os.environ.copy()
-    environment["OPENAGENT_SECRETBOX_ACL_PATH"] = str(path)
-    environment["OPENAGENT_SECRETBOX_ACL_SID"] = _windows_current_sid()
-    try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                _WINDOWS_OWNER_ONLY_SCRIPT,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=creation_flags,
-            env=environment,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WriteError("unable to set owner-only Windows permissions") from exc
-    outcome = result.stdout.strip().casefold()
-    if result.returncode != 0 or outcome not in {"true", "false"}:
-        raise WriteError("unable to set owner-only Windows permissions")
-    return outcome == "true"
 
 
 def _set_owner_only(fd: int, path: Path | None = None) -> None:
@@ -482,6 +606,10 @@ def _write_temp_file(directory: Path, prefix: str, data: bytes) -> Path:
     path = Path(raw_path)
     try:
         _set_owner_only(fd, path)
+        opened = os.fstat(fd)
+        current = _inspect_destination(path)
+        if current is None or not _same_file_identity(opened, current):
+            raise WriteError("temporary target changed during permission validation")
         with os.fdopen(fd, "wb", closefd=True) as handle:
             fd = -1
             handle.write(data)
@@ -828,6 +956,7 @@ def apply_request(
     conflicts: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     env_by_target: dict[str, dict[str, str]] = {}
+    env_public_names: dict[str, dict[str, str]] = {}
     file_needs: list[tuple[Any, Any]] = []
     try:
         for need in request.needs:
@@ -837,7 +966,9 @@ def apply_request(
             if need.type == "env":
                 if not isinstance(raw_value, str):
                     raise WriteError("invalid environment value")
-                env_by_target.setdefault(request.write_policy.env_file, {})[need.name] = raw_value
+                target = request.write_policy.env_file
+                env_by_target.setdefault(target, {})[need.name] = raw_value
+                env_public_names.setdefault(target, {})[need.name] = need.name
             elif need.type == "env_file":
                 target = need.target or request.write_policy.env_file
                 if isinstance(raw_value, str):
@@ -850,6 +981,8 @@ def apply_request(
                 if overlap:
                     raise WriteError("duplicate environment input")
                 env_by_target[target].update(parsed)
+                public_names = env_public_names.setdefault(target, {})
+                public_names.update({key: need.name for key in parsed})
             elif need.type == "file":
                 file_needs.append((need, raw_value))
 
@@ -860,10 +993,31 @@ def apply_request(
                 policy=effective_policy,
                 allow_overwrite=allow_overwrite,
             )
-            conflicts.extend(env_result.conflicts)
+            aliases = env_public_names.get(target, {})
+            public_conflicts: list[dict[str, Any]] = []
+            for item in env_result.conflicts:
+                public_item = dict(item)
+                if public_item.get("type") == "env":
+                    public_name = aliases.get(str(public_item.get("name", "")))
+                    if public_name is None:
+                        raise WriteError("environment result contains an undeclared name")
+                    public_item["name"] = public_name
+                if public_item not in public_conflicts:
+                    public_conflicts.append(public_item)
+            conflicts.extend(public_conflicts)
             if env_result.conflicts:
                 break
-            written.extend(env_result.actions)
+            public_actions: list[dict[str, Any]] = []
+            for item in env_result.actions:
+                public_item = dict(item)
+                if public_item.get("type") == "env":
+                    public_name = aliases.get(str(public_item.get("name", "")))
+                    if public_name is None:
+                        raise WriteError("environment result contains an undeclared name")
+                    public_item["name"] = public_name
+                if public_item not in public_actions:
+                    public_actions.append(public_item)
+            written.extend(public_actions)
         if not conflicts:
             for need, raw_value in file_needs:
                 file_result = write_private_file(
@@ -903,19 +1057,11 @@ def apply_request(
         missing=(),
         blocked=blocked,
     )
-    # Belt-and-suspenders exact-value scrubbing.  This also protects future
-    # result fields added by callers around this helper.
-    known_secrets: list[str | bytes] = []
-    for value in values.values():
-        if isinstance(value, (str, bytes)):
-            known_secrets.append(value)
-        elif isinstance(value, Mapping):
-            known_secrets.extend(item for item in value.values() if isinstance(item, (str, bytes)))
-    redacted = cast(dict[str, Any], redact_result(status_result, known_secrets))
-    # Protocol enums are public control metadata.  A short secret such as
-    # ``app`` must not turn ``applied`` into an invalid state after a real write.
-    redacted["status"] = status
-    return redacted
+    # The writer result is a closed, metadata-only protocol.  Scrubbing submitted
+    # literals across it would corrupt public metadata when a secret happens to
+    # equal an enum, name, or target.  Normalization returns a detached allowlisted
+    # copy and rejects any future value-bearing extension before it can escape.
+    return normalize_writer_result(status_result)
 
 
 __all__ = [

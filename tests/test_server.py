@@ -13,6 +13,7 @@ from wsgiref.util import setup_testing_defaults
 
 import pytest
 
+from openagent_secretbox.protocol import normalize_writer_result
 from openagent_secretbox.server import (
     InvalidState,
     InvalidToken,
@@ -297,10 +298,47 @@ def test_intake_page_explains_one_time_flow_and_has_distinct_states() -> None:
     assert "此页面只能使用一次".encode() in body
     assert "安全会话已就绪，可以填写并上传文件".encode() in body
     assert "凭据已安全保存".encode() in body
+    assert "保存未完成，此页面无法重试".encode() in body
+    assert "部分目标可能已经写入".encode() in body
+    assert "无法确认取消结果".encode() in body
+    assert "此页面不会再次启用".encode() in body
     assert "请生成新的 SecretBox 链接".encode() in body
     assert b"showUnavailable" in body
     assert b"json(fetch(" not in body
     assert body.count(b".then(json)") == 3
+
+
+def test_failed_submit_response_is_a_terminal_browser_state() -> None:
+    app = create_app(request=REQUEST)
+
+    status, _, body = call_app(app, "GET", app.handle.path.split("#", 1)[0])
+
+    assert status == 200
+    assert b"let token = new URLSearchParams" in body
+    assert b"try { sessionStorage.removeItem(storageKey); } catch (_)" in body
+    assert b"session = null;" in body
+    assert b"token = null;" in body
+    assert b"const clearSecretInputs = () =>" in body
+    assert b".forEach((input) => { input.value = ''; });" in body
+    assert (
+        b"const showTerminalState = (panel) => {\n"
+        b"      setReady(false);\n"
+        b"      clearSecretInputs();\n"
+        b"      clearLocalSession();\n"
+        b"      showFinalState(panel);"
+    ) in body
+    assert (
+        b"if (applied.status !== 'applied') {\n"
+        b"          showTerminalFailure();\n"
+        b"          return;\n"
+        b"        }"
+    ) in body
+    assert b"throw new Error('The request could not be fully applied" not in body
+    assert b"let submissionDispatched = false;" in body
+    assert b"submissionDispatched = true;\n        const applied = await fetch(" in body
+    assert b"if (submissionDispatched) { showTerminalFailure(); return; }" in body
+    assert b"const showCancelUncertain = () => showTerminalState(cancelUncertain);" in body
+    assert b"} catch (error) {\n        showCancelUncertain();" in body
 
 
 def test_password_inputs_have_local_visibility_controls_that_remask() -> None:
@@ -424,6 +462,161 @@ def test_exchange_csrf_submit_and_result_redaction() -> None:
     assert secret.encode() not in applied_body
     assert b"[redacted]" in applied_body
     assert received == {"request_id": REQUEST["request_id"], "value": secret}
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "openai-local-setup",
+        "applied",
+        "env",
+        "OPENAI_API_KEY",
+        "added",
+        ".env.local",
+    ],
+)
+def test_submit_preserves_closed_writer_metadata_on_secret_collision(secret: str) -> None:
+    expected_result = {
+        "request_id": REQUEST["request_id"],
+        "status": "applied",
+        "written": [
+            {
+                "type": "env",
+                "name": "OPENAI_API_KEY",
+                "action": "added",
+                "target": ".env.local",
+            }
+        ],
+        "conflicts": [],
+        "missing": [],
+        "blocked": [],
+    }
+
+    app = create_app(request=REQUEST, apply_fn=lambda _request, _values: expected_result)
+    handle = app.handle
+    exchanged, headers, body = call_app(
+        app,
+        "POST",
+        "/api/exchange",
+        {"session_id": handle.session_id, "token": handle.token},
+    )
+    assert exchanged == 200
+    exchange = json.loads(body)
+    cookie = headers["set-cookie"].split(";", 1)[0]
+
+    status, _, body = call_app(
+        app,
+        "POST",
+        f"/api/sessions/{exchange['session_id']}/submit",
+        {"values": {"env": {"OPENAI_API_KEY": secret}}},
+        csrf=exchange["csrf_token"],
+        cookie=cookie,
+    )
+
+    payload = json.loads(body)
+    assert status == 200
+    assert payload["status"] == "applied"
+    assert payload["result"] == expected_result
+    assert normalize_writer_result(payload["result"]) == expected_result
+
+
+def test_closed_writer_result_with_value_extension_fails_without_leaking() -> None:
+    secret = "secret-extension-must-not-return"
+
+    def apply(_request: Any, _values: Any) -> dict[str, Any]:
+        return {
+            "request_id": REQUEST["request_id"],
+            "status": "applied",
+            "written": [
+                {
+                    "type": "env",
+                    "name": "OPENAI_API_KEY",
+                    "action": "added",
+                    "target": ".env.local",
+                }
+            ],
+            "conflicts": [],
+            "missing": [],
+            "blocked": [],
+            "value": secret,
+        }
+
+    app = create_app(request=REQUEST, apply_fn=apply)
+    handle = app.handle
+    exchanged, headers, body = call_app(
+        app,
+        "POST",
+        "/api/exchange",
+        {"session_id": handle.session_id, "token": handle.token},
+    )
+    assert exchanged == 200
+    exchange = json.loads(body)
+    cookie = headers["set-cookie"].split(";", 1)[0]
+
+    status, _, body = call_app(
+        app,
+        "POST",
+        f"/api/sessions/{exchange['session_id']}/submit",
+        {"values": {"env": {"OPENAI_API_KEY": secret}}},
+        csrf=exchange["csrf_token"],
+        cookie=cookie,
+    )
+
+    assert status == 500
+    assert json.loads(body)["error"]["code"] == "apply_failed"
+    assert secret.encode() not in body
+    stored = app.store.get(handle.session_id)
+    assert stored["status"] == "failed"
+    assert "result" not in stored
+
+
+def test_closed_writer_result_cannot_smuggle_secret_as_metadata() -> None:
+    secret = "secret-metadata-must-not-return"
+    secret_prefix = secret[:8]
+
+    def apply(_request: Any, _values: Any) -> dict[str, Any]:
+        return {
+            "request_id": REQUEST["request_id"],
+            "status": "applied",
+            "written": [
+                {
+                    "type": "env",
+                    "name": secret_prefix,
+                    "action": "added",
+                    "target": ".env.local",
+                }
+            ],
+            "conflicts": [],
+            "missing": [],
+            "blocked": [],
+        }
+
+    app = create_app(request=REQUEST, apply_fn=apply)
+    handle = app.handle
+    exchanged, headers, body = call_app(
+        app,
+        "POST",
+        "/api/exchange",
+        {"session_id": handle.session_id, "token": handle.token},
+    )
+    assert exchanged == 200
+    exchange = json.loads(body)
+    cookie = headers["set-cookie"].split(";", 1)[0]
+
+    status, _, body = call_app(
+        app,
+        "POST",
+        f"/api/sessions/{exchange['session_id']}/submit",
+        {"values": {"env": {"OPENAI_API_KEY": secret}}},
+        csrf=exchange["csrf_token"],
+        cookie=cookie,
+    )
+
+    assert status == 500
+    assert json.loads(body)["error"]["code"] == "apply_failed"
+    assert secret.encode() not in body
+    assert secret_prefix.encode() not in body
+    assert "result" not in app.store.get(handle.session_id)
 
 
 def test_submit_without_core_apply_has_clear_non_secret_error() -> None:
