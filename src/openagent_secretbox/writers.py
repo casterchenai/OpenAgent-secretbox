@@ -189,7 +189,7 @@ def _inspect_windows_acl(
             check=False,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
             creationflags=creation_flags,
             env=environment,
             cwd=str(Path(powershell).parent),

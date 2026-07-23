@@ -409,6 +409,42 @@ def test_windows_acl_inspection_rejects_unexpected_output(
         writers._set_windows_owner_only(tmp_path / "private.pem")
 
 
+def test_windows_acl_inspection_timeout_is_fail_closed_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private.pem"
+    commands: list[list[str]] = []
+    seen_timeout: list[object] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        seen_timeout.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output="sensitive-timeout-output",
+            stderr="sensitive-timeout-error",
+        )
+
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: "S-1-5-21-test")
+    monkeypatch.setattr(
+        writers, "_windows_system_executable", _trusted_windows_test_executable
+    )
+    monkeypatch.setattr(
+        writers, "_windows_powershell_environment", _trusted_windows_test_environment
+    )
+    monkeypatch.setattr(writers.subprocess, "run", fake_run)
+
+    with pytest.raises(WriteError, match="unable to inspect Windows permissions") as raised:
+        writers._set_windows_owner_only(target)
+
+    assert seen_timeout == [30]
+    assert len(commands) == 1
+    assert "sensitive-timeout" not in str(raised.value)
+    assert str(target) not in str(raised.value)
+
+
 def test_windows_acl_command_failure_is_fail_closed_and_redacted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
