@@ -415,9 +415,12 @@ reserves stdout for MCP protocol frames and closes all active listeners on exit.
 
 See [the result protocol](./docs/result-protocol.md), its
 [JSON Schema](./schemas/result-v1.json), and the
-[Hermes integration](./integrations/hermes/README.md). The sensitive bootstrap
-event emitted by CLI `--no-open --json` is deliberately outside the agent-safe
-result protocol.
+[Hermes integration](./integrations/hermes/README.md). When installing the Hermes
+skill from a direct URL, verify that the installed directory contains
+`SKILL.md`, `references/trusted-user-boundary.md`, and
+`templates/request-v1.json`; an exit code of 0 can still leave a partial install.
+The sensitive bootstrap event emitted by CLI `--no-open --json` is deliberately
+outside the agent-safe result protocol.
 
 Later versions may support controlled command execution:
 
