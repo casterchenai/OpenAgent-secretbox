@@ -66,40 +66,22 @@ name above, Hermes exposes these tool names:
 
 ## 3. Install the skill
 
-After these files are published to the repository's default `main` branch,
-use Hermes's documented direct-URL form. This makes the fetched `SKILL.md`
-revision explicit instead of relying on source-router interpretation of a
-repository/subdirectory identifier.
+The skill needs the full directory, not just `SKILL.md`:
 
-Inspect the community skill before installing it:
-
-```bash
-hermes skills inspect "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md"
+```text
+openagent-secretbox/
+├── SKILL.md
+├── references/trusted-user-boundary.md
+└── templates/request-v1.json
 ```
 
-Install the same URL into the `security` category:
+`SKILL.md` links the two support files. If they are missing, Hermes cannot load
+the trusted-user boundary notes or the request template.
 
-```bash
-hermes skills install "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md" --category security
-```
+### Preferred: local checkout or `external_dirs`
 
-For a reproducible review, replace `main` in both commands with the same full
-Git commit SHA. A raw URL returns 404 until that revision and the integration
-files have been pushed to GitHub.
-
-Hermes does not enumerate the surrounding GitHub directory for a direct URL.
-It downloads `SKILL.md` plus only the paths that `SKILL.md` explicitly
-references under its allowlisted support directories. This skill explicitly
-links both bundled support files, so installation also fetches:
-
-- `references/trusted-user-boundary.md`
-- `templates/request-v1.json`
-
-The install summary should list those paths with `SKILL.md`. If either fetch
-fails, Hermes rejects the bundle instead of silently installing an incomplete
-skill.
-
-For a local checkout, add the skill collection to `~/.hermes/config.yaml`:
+If you already have this repository checked out, point Hermes at the complete
+skill collection:
 
 ```yaml
 skills:
@@ -115,15 +97,104 @@ skills:
     - E:/path/to/OpenAgent-secretbox/integrations/hermes/skills
 ```
 
+`external_dirs` reads the complete skill directory in place, so the adjacent
+`references/` and `templates/` directories remain available without a separate
+download or copy step.
+
+You can also copy the complete skill directory into the Hermes skills tree:
+
+```bash
+SRC=/absolute/path/to/OpenAgent-secretbox/integrations/hermes/skills/openagent-secretbox
+DST=~/.hermes/skills/security/openagent-secretbox
+mkdir -p "$DST/references" "$DST/templates"
+cp -a "$SRC/SKILL.md" "$DST/"
+cp -a "$SRC/references/." "$DST/references/"
+cp -a "$SRC/templates/." "$DST/templates/"
+```
+
+Verify the installed bundle before using the skill:
+
+```bash
+find ~/.hermes/skills/security/openagent-secretbox -type f | sort
+```
+
+A complete install must include all three paths:
+
+```text
+~/.hermes/skills/security/openagent-secretbox/SKILL.md
+~/.hermes/skills/security/openagent-secretbox/references/trusted-user-boundary.md
+~/.hermes/skills/security/openagent-secretbox/templates/request-v1.json
+```
+
+### Optional: direct URL install
+
+After these files are published to the repository's default `main` branch, you
+can use Hermes's documented direct-URL form. This makes the fetched `SKILL.md`
+revision explicit instead of relying on source-router interpretation of a
+repository/subdirectory identifier.
+
+Inspect the community skill before installing it:
+
+```bash
+hermes skills inspect "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md"
+```
+
+Install the same URL into the `security` category:
+
+```bash
+hermes skills install "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md" --category security --yes
+```
+
+For a reproducible review, replace `main` in both commands with the same full
+Git commit SHA. A raw URL returns 404 until that revision and the integration
+files have been pushed to GitHub.
+
+#### Important: verify the URL install is complete
+
+Hermes does not enumerate the surrounding GitHub directory for a direct URL.
+It downloads `SKILL.md`, and may also try to fetch only the relative paths that
+`SKILL.md` explicitly references under allowlisted support directories such as
+`references/` and `templates/`.
+
+Do **not** assume the install is complete just because the command exits 0.
+Inspect the install summary and the installed files:
+
+```bash
+# The install summary should list more than SKILL.md.
+# Then verify on disk:
+find ~/.hermes/skills/security/openagent-secretbox -type f | sort
+```
+
+If the directory contains only `SKILL.md`, the install is incomplete. Hermes
+may report success while leaving the skill unable to open:
+
+- `references/trusted-user-boundary.md`
+- `templates/request-v1.json`
+
+Repair an incomplete URL install from a local checkout:
+
+```bash
+SRC=/absolute/path/to/OpenAgent-secretbox/integrations/hermes/skills/openagent-secretbox
+DST=~/.hermes/skills/security/openagent-secretbox
+mkdir -p "$DST/references" "$DST/templates"
+cp -a "$SRC/SKILL.md" "$DST/"
+cp -a "$SRC/references/." "$DST/references/"
+cp -a "$SRC/templates/." "$DST/templates/"
+find "$DST" -type f | sort
+```
+
+Or reinstall from a complete local skill directory via `external_dirs` as shown
+above.
+
+### After install
+
 Start a new session or run `/reload-skills`, then invoke:
 
 ```text
 /openagent-secretbox prepare the credential intake for this project
 ```
 
-`external_dirs` reads the complete skill directory in place, so the adjacent
-`references/` and `templates/` directories remain available without a separate
-download or copy step. Treat the checkout as agent-writable unless filesystem
+Treat the checkout as agent-writable unless filesystem
 permissions make it read-only.
 
 ## MCP flow
