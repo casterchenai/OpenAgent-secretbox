@@ -375,18 +375,24 @@ python -m pip install -e ".[mcp]"
 ```
 
 Configure an MCP client to start SecretBox over stdio with a workspace chosen by
-the trusted user:
+the trusted user. Prefer one host-wide default for agent use
+(`~/.hermes/workspaces/default`) unless a project needs its own secret root:
 
 ```json
 {
   "mcpServers": {
     "openagent-secretbox": {
       "command": "secretbox-mcp",
-      "args": ["--workspace", "/absolute/path/to/project"]
+      "args": ["--workspace", "/absolute/path/to/.hermes/workspaces/default"]
     }
   }
 }
 ```
+
+Agents must use that registered workspace automatically and must not pass
+`workspace_root` in tool requests. See
+[Hermes integration](./integrations/hermes/README.md) for the default-workspace
+agent rule and config.yaml registration workaround.
 
 The server exposes three tools:
 

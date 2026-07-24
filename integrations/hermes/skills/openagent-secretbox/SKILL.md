@@ -1,7 +1,7 @@
 ---
 name: openagent-secretbox
-description: "Open local secret intake without exposing secret values."
-version: 1.1.0
+description: "Open local secret intake without exposing secret values. Use when credentials, API keys, tokens, env vars, or secret files must be written locally without pasting values into chat. Default MCP workspace is the host-registered path (often ~/.hermes/workspaces/default); agents never choose or override it unless the user explicitly directs a trusted re-registration outside chat."
+version: 1.2.0
 author: casterchenai
 license: MIT
 platforms: [linux, macos, windows]
@@ -28,6 +28,45 @@ SecretBox MCP tools; use the user-launched CLI flow only as a fallback.
 - Do not use it for remote intake. The supported flow is loopback-only on the
   trusted user's machine.
 
+## Default workspace rule (agent-critical)
+
+Unless the user **explicitly** names a different trusted workspace and directs
+a trusted-terminal reconfiguration, treat the pre-registered MCP workspace as
+the only write root.
+
+| Situation | Agent behavior |
+|---|---|
+| User says "set up API key / secret / .env" with no path | Use MCP as-is. Do **not** ask for a workspace path. |
+| User says "for this project" but MCP is already registered | Still use the registered default. Report that secrets land under the MCP workspace (for example `~/.hermes/workspaces/default`). Do not invent a project path. |
+| User explicitly wants project-local secrets under `/path/to/project` | Stop. Tell the user that workspace is fixed at MCP startup. Offer the trusted-terminal re-register command for that absolute path. Do not edit Hermes config yourself. |
+| MCP tools missing | Manual fallback only. Prefer default workspace `~/.hermes/workspaces/default` (expand to absolute) unless the user already named another absolute path. |
+
+Canonical host default used by this integration when the trusted user wants
+all sessions to share one secret root:
+
+```text
+~/.hermes/workspaces/default
+```
+
+On a typical Linux Hermes host that expands to:
+
+```text
+/root/.hermes/workspaces/default
+```
+
+or `$HOME/.hermes/workspaces/default` for a non-root install. Agents never pass
+this path in MCP request objects; they only report it when explaining where
+files will land.
+
+Default host allowlist (startup policy, not agent input):
+
+- `.env`
+- `.env.*`
+- `secrets/*`
+
+Relative targets in requests (for example `.env.local`, `secrets/key.pem`) are
+always resolved under that fixed workspace.
+
 ## Prerequisites
 
 Prefer these exact tools from the user-configured `openagent-secretbox` MCP
@@ -38,9 +77,21 @@ server:
 - `mcp__openagent_secretbox__cancel_secret_intake`
 
 The trusted user, not the agent, must register that server with a fixed
-workspace and host allowlist. If the tools are absent, do not run `hermes mcp
-add` or edit Hermes config. Use the manual fallback below and point the user to
-the integration install instructions.
+workspace and host allowlist. Recommended default for host-wide use:
+
+```yaml
+mcp_servers:
+  openagent-secretbox:
+    command: /absolute/path/to/secretbox-mcp
+    args:
+      - --workspace
+      - /absolute/path/to/.hermes/workspaces/default
+    enabled: true
+```
+
+If the tools are absent, do not run `hermes mcp add` or edit Hermes config. Use
+the manual fallback below and point the user to the integration install
+instructions.
 
 Read [the trusted user boundary](references/trusted-user-boundary.md) before
 using an unfamiliar service or a target beyond the default allowlist.
@@ -51,8 +102,11 @@ Invoke this skill with credential names and the intended task, never credential
 values:
 
 ```text
-/openagent-secretbox prepare OPENAI_API_KEY for this project
+/openagent-secretbox prepare OPENAI_API_KEY for local setup
 ```
+
+Do not require the user to supply a workspace path. Use the pre-registered MCP
+workspace automatically.
 
 Use [the request template](templates/request-v1.json) as a structural starting
 point. Replace or remove every example need before opening intake.
@@ -61,13 +115,14 @@ point. Replace or remove every example need before opening intake.
 
 | Actor | Allowed | Forbidden |
 |---|---|---|
-| Hermes | Define metadata; call MCP open/status/cancel; report redacted status | Receive values; pass workspace/host allowlist; receive or open intake URLs; inspect targets |
-| Trusted user | Register fixed MCP policy; review targets; use local browser | Paste URL tokens or values into chat |
+| Hermes | Define metadata; call MCP open/status/cancel; report redacted status and default relative targets | Receive values; choose/pass workspace or host allowlist; receive or open intake URLs; inspect targets; edit MCP config |
+| Trusted user | Register fixed MCP policy (prefer `~/.hermes/workspaces/default`); review targets; use local browser | Paste URL tokens or values into chat |
 | SecretBox MCP | Apply startup policy; open browser server-side; return ids/status only | Return URL, token, session id, or submitted values |
 
 Hard stops:
 
 - Never ask for or accept a secret value through chat or a tool argument.
+- Never ask "which workspace?" when MCP is already registered. Use the default.
 - Never call `secretbox serve`, `secretbox-mcp`, or `hermes mcp add` through
   `terminal`, a subagent, a script, a scheduled job, or another agent tool.
 - Never navigate to, poll, inspect, or screenshot an `/intake/` URL with Hermes.
@@ -93,7 +148,8 @@ Identify:
 - whether each input is required.
 
 Ask only for missing metadata. Never ask the user to paste, upload, describe,
-partially reveal, hash, encode, or confirm a secret value in chat.
+partially reveal, hash, encode, or confirm a secret value in chat. Never ask
+for a workspace path unless the user is deliberately changing trusted policy.
 
 Use `env` for one environment variable, `file` for a private file, and
 `env_file` only when the user explicitly wants to paste an environment block in
@@ -127,9 +183,11 @@ host-policy argument.
 ### 3. Preview the request
 
 Show only the title, variable/input names, relative targets, required flags,
-TTL, and enforced write policy. Obtain confirmation unless the user already
-approved those exact fields in the current turn. Do not display placeholders
-that could be mistaken for real credentials.
+TTL, enforced write policy, and a one-line reminder that writes go under the
+pre-registered MCP workspace (default host root: `~/.hermes/workspaces/default`).
+Obtain confirmation unless the user already approved those exact fields in the
+current turn. Do not display placeholders that could be mistaken for real
+credentials.
 
 Completion criterion: the user can see every proposed write target before the
 browser accepts values.
@@ -188,8 +246,9 @@ Do not retry cancellation and do not open a replacement intake. Poll that same
 `intake_id` until it reaches `applied` or `failed`, then report the real result.
 
 On success, report only declared names, relative target paths, write actions,
-and redacted status. Never verify by reading `.env`, file contents, process
-environments, logs, hashes, or encoded derivatives.
+and redacted status. Optionally remind that absolute paths are under the
+registered workspace root. Never verify by reading `.env`, file contents,
+process environments, logs, hashes, or encoded derivatives.
 
 Completion criterion: a terminal redacted status is reported and no submitted
 value entered Hermes.
@@ -198,11 +257,15 @@ value entered Hermes.
 
 Use this only when the trusted MCP tools are absent or unavailable.
 
-1. Write the metadata-only request JSON under
+1. Choose workspace:
+   - user-named absolute path if they explicitly provided one in this turn;
+   - otherwise default to `~/.hermes/workspaces/default` expanded to an absolute
+     path (create nothing with elevated privileges; tell the user if missing).
+2. Write the metadata-only request JSON under
    `<workspace>/.secretbox/requests/<request-id>.json` or another untracked
    path. Omit `workspace_root`, `allowed_targets`, and all values.
-2. Run only `secretbox validate "<absolute-request-path>"`. Do not start intake.
-3. Print one reviewed command:
+3. Run only `secretbox validate "<absolute-request-path>"`. Do not start intake.
+4. Print one reviewed command:
 
 ```bash
 secretbox serve --workspace "<absolute-workspace-path>" --request "<absolute-request-path>"
@@ -224,8 +287,12 @@ agent-visible output, and the user reports only a redacted outcome.
 
 - Running `hermes mcp add` from an agent tool lets the agent choose the trusted
   workspace. Registration belongs to a separate user-controlled terminal.
-- `--args` is a remainder argument in Hermes CLI and must be the final Hermes
-  option; all following values configure `secretbox-mcp`.
+- Do not ask the user for a workspace on every secret request. Default to the
+  registered MCP root / `~/.hermes/workspaces/default`.
+- On some Hermes CLI builds, `hermes mcp add ... --args --workspace PATH` may
+  misparse `--workspace` as a Hermes flag. Prefer writing the absolute command
+  and args into `~/.hermes/config.yaml` from a trusted terminal, then
+  `hermes mcp test openagent-secretbox`.
 - MCP request `workspace_root` and `allowed_targets` are unnecessary authority
   assertions. Omit them even though request schema v1 accepts them.
 - Manual `secretbox serve --no-open --json` emits the bearer URL. It is
@@ -237,10 +304,16 @@ agent-visible output, and the user reports only a redacted outcome.
 - Output redaction and stdio environment filtering are not containment. An
   unrestricted local Hermes process can still read files available to its OS
   identity.
+- Writing project app secrets into the host default workspace is intentional for
+  agent convenience. If the app must read secrets from a project directory, the
+  trusted user must re-register MCP for that project path or copy/symlink
+  outside chat after apply.
 
 ## Verification
 
 - [ ] The trusted user configured MCP workspace/allowlist outside Hermes.
+- [ ] Unless the user explicitly overrode policy, the agent used the default
+      registered workspace and did not solicit a path.
 - [ ] The request contains metadata only and omits workspace/allowed targets.
 - [ ] No secret, encoded secret, bearer token, or intake URL entered Hermes.
 - [ ] MCP open returned only an intake id, redacted status, and expiry metadata.
