@@ -219,13 +219,22 @@ fields. The expected result contains `schema_version`, `intake_id`,
 `request_id`, `status`, `expires_at`, and `browser_opened` only. `intake_id` is
 a non-secret status handle and may remain in context.
 
-Tell the user that SecretBox opened the local browser and that the page is
-single-use. Do not ask them to send anything from the page back to chat.
+Tell the user that SecretBox opened a one-time form. On **desktop** hosts the
+OS browser opens automatically. On **headless / Hermes Web UI** hosts with UI
+handoff configured, tell the user to open the bookmarked SecretBox form index
+(for example `http://HOST:8787/`) and click the pending title — never invent or
+paste intake URLs yourself.
+
+Do not ask them to send anything from the page back to chat except a status-only
+word such as `applied`.
 
 If MCP returns `invalid_request` or `policy_rejected`, fix metadata or ask the
 user to review trusted policy. Never weaken write policy or configure a broader
 workspace/allowlist yourself. If it returns `browser_open_failed` or
-`server_unavailable`, cancel any known intake and use Manual Fallback.
+`server_unavailable`, do **not** pretend a chat form exists. Report that handoff
+is not configured / browser open failed, and ask the user whether to enable UI
+handoff (trusted terminal) or cancel. Do not fall back to printing
+`secretbox serve` as if it were a conversation form.
 
 Completion criterion: the result is `awaiting_input`, contains no URL/token,
 and the user's local browser is open.

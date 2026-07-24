@@ -40,6 +40,58 @@ Agent rule encoded in the skill:
 
 Default allowlist remains `.env`, `.env.*`, and `secrets/*` under that root.
 
+## Headless / Hermes Web UI form (UI handoff)
+
+If the Hermes host has no desktop browser (remote ECS, no `DISPLAY`), enable the
+UI handoff bridge so users can fill forms in **their** browser without pasting
+secrets into chat.
+
+Trusted terminal (once):
+
+```bash
+# 1) Start handoff bridge (public form index on :8787)
+TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(32))
+PY
+)"
+echo "$TOKEN" > ~/.hermes/workspaces/default/.secretbox-handoff.token
+chmod 600 ~/.hermes/workspaces/default/.secretbox-handoff.token
+
+# resolve secretbox-ui-handoff from Hermes venv if needed
+secretbox-ui-handoff \
+  --host 0.0.0.0 \
+  --port 8787 \
+  --token-file ~/.hermes/workspaces/default/.secretbox-handoff.token \
+  --public-base "http://YOUR_HOST_IP:8787" &
+
+# 2) Register MCP with handoff publish (loopback only)
+# Prefer config.yaml if hermes mcp add misparses flags:
+```
+
+```yaml
+mcp_servers:
+  openagent-secretbox:
+    command: /absolute/path/to/secretbox-mcp
+    args:
+      - --workspace
+      - /absolute/path/to/.hermes/workspaces/default
+      - --ui-handoff-url
+      - http://127.0.0.1:8787/internal/publish
+      - --ui-handoff-token-file
+      - /absolute/path/to/.hermes/workspaces/default/.secretbox-handoff.token
+    enabled: true
+```
+
+User flow after Agent opens intake:
+
+1. Open `http://YOUR_HOST_IP:8787/` in the browser (bookmark this).
+2. Click the pending form title.
+3. Fill secrets on the one-time page.
+4. Tell the agent only `applied` / redacted status — never paste values or URLs.
+
+Agents must still never request secret values in chat and never open intake URLs.
+
 ## 1. Install SecretBox with MCP support
 
 Install the package in an environment visible to Hermes:

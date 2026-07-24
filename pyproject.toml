@@ -51,6 +51,7 @@ dev = [
 [project.scripts]
 secretbox = "openagent_secretbox.cli:main"
 secretbox-mcp = "openagent_secretbox.mcp_server:main"
+secretbox-ui-handoff = "openagent_secretbox.ui_handoff:main"
 
 [tool.hatch.version]
 path = "src/openagent_secretbox/__init__.py"

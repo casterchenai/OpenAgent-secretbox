@@ -36,6 +36,7 @@ from .protocol import (
 from .redaction import REDACTED, redact_result
 from .schema import RequestValidationError, validate_request
 from .server import Serving, UnknownSession, serve_once
+from .ui_handoff import publish_intake_url
 from .writers import apply_request
 
 SCHEMA_VERSION = 1
@@ -134,6 +135,9 @@ class IntakeManager:
         browser_open: Callable[[str], bool] | None = None,
         server_factory: Callable[..., Serving] = serve_once,
         clock: Callable[[], float] = time.time,
+        ui_handoff_url: str | None = None,
+        ui_handoff_token: str | None = None,
+        ui_handoff_publish: Callable[..., bool] | None = None,
     ) -> None:
         supplied = Path(workspace).expanduser()
         try:
@@ -157,6 +161,22 @@ class IntakeManager:
         self._browser_open = browser_open or (lambda url: bool(webbrowser.open(url, new=2)))
         self._server_factory = server_factory
         self._clock = clock
+        handoff_url = (ui_handoff_url or "").strip() or None
+        handoff_token = (ui_handoff_token or "").strip() or None
+        if (handoff_url is None) ^ (handoff_token is None):
+            raise McpConfigurationError(
+                "ui handoff requires both --ui-handoff-url and --ui-handoff-token"
+            )
+        if handoff_url is not None and not (
+            handoff_url.startswith("http://127.0.0.1:")
+            or handoff_url.startswith("http://localhost:")
+        ):
+            raise McpConfigurationError("ui handoff URL must target loopback HTTP")
+        if handoff_token is not None and len(handoff_token) < 16:
+            raise McpConfigurationError("ui handoff token must be at least 16 characters")
+        self._ui_handoff_url = handoff_url
+        self._ui_handoff_token = handoff_token
+        self._ui_handoff_publish = ui_handoff_publish or publish_intake_url
         self._lock = threading.RLock()
         self._intakes: dict[str, _ManagedIntake] = {}
         self._closed = False
@@ -340,24 +360,47 @@ class IntakeManager:
                 )
                 if serving.url is None or serving.handle is None:
                     raise RuntimeError("missing intake handle")
-                opened = self._browser_open(serving.url)
-                if not opened:
-                    raise RuntimeError("browser did not accept the URL")
             except Exception:
                 if serving is not None:
                     serving.close()
                 return _error(
-                    "browser_open_failed" if serving is not None else "server_unavailable",
-                    (
-                        "The local intake page could not be opened."
-                        if serving is not None
-                        else "The local intake server could not be started."
-                    ),
+                    "server_unavailable",
+                    "The local intake server could not be started.",
                 )
 
             intake_id = "int_" + secrets.token_urlsafe(18)
             while intake_id in self._intakes:
                 intake_id = "int_" + secrets.token_urlsafe(18)
+
+            delivery = "none"
+            try:
+                if self._browser_open(serving.url):
+                    delivery = "desktop"
+                elif self._ui_handoff_url and self._ui_handoff_token:
+                    published = self._ui_handoff_publish(
+                        self._ui_handoff_url,
+                        token=self._ui_handoff_token,
+                        intake_id=intake_id,
+                        request_id=model.request_id,
+                        title=str(getattr(model, "title", None) or model.request_id),
+                        expires_at=_iso_timestamp(serving.handle.expires_at),
+                        intake_url=serving.url,
+                    )
+                    if published:
+                        delivery = "handoff"
+            except Exception:
+                delivery = "none"
+
+            if delivery == "none":
+                serving.close()
+                return _error(
+                    "browser_open_failed",
+                    (
+                        "The local intake page could not be opened. Configure a UI handoff "
+                        "bridge for headless/remote hosts, or open intake on a desktop."
+                    ),
+                )
+
             record = _ManagedIntake(
                 intake_id=intake_id,
                 request_id=model.request_id,
@@ -365,6 +408,9 @@ class IntakeManager:
                 created_at=self._clock(),
             )
             self._intakes[intake_id] = record
+            # Delivery path is intentionally not exposed beyond browser_opened=true.
+            # Desktop open and UI handoff both mean the user can fill the form outside
+            # agent context; never return URLs, tokens, or path hints that embed them.
             return normalize_mcp_result(
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -561,6 +607,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ACTIVE_INTAKES,
         help=f"maximum simultaneous intake pages (default: {DEFAULT_MAX_ACTIVE_INTAKES})",
     )
+    parser.add_argument(
+        "--ui-handoff-url",
+        default="",
+        help=(
+            "loopback publish URL for headless UI handoff "
+            "(e.g. http://127.0.0.1:8787/internal/publish)"
+        ),
+    )
+    parser.add_argument(
+        "--ui-handoff-token",
+        default="",
+        help="shared secret for the UI handoff bridge (min 16 chars)",
+    )
+    parser.add_argument(
+        "--ui-handoff-token-file",
+        default="",
+        help="read UI handoff token from a file (mode 600 recommended)",
+    )
     return parser
 
 
@@ -568,11 +632,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the MCP server over stdio; stdout is reserved for protocol frames."""
 
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
+    handoff_token = (args.ui_handoff_token or "").strip()
+    if not handoff_token and args.ui_handoff_token_file:
+        try:
+            handoff_token = Path(args.ui_handoff_token_file).expanduser().read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as exc:
+            print(f"secretbox-mcp: cannot read ui handoff token file: {exc}", file=sys.stderr)
+            return 2
     try:
         manager = IntakeManager(
             args.workspace,
             allowed_targets=DEFAULT_ALLOWED_TARGETS + tuple(args.allow_target),
             max_active=args.max_active,
+            ui_handoff_url=(args.ui_handoff_url or "").strip() or None,
+            ui_handoff_token=handoff_token or None,
         )
         app = create_mcp_server(manager)
     except McpConfigurationError as exc:

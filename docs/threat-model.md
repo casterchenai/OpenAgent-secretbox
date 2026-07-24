@@ -23,7 +23,20 @@ Keep sensitive values out of AI chat messages, LLM context windows, generated do
 - secret rotation
 - long-term encrypted secret storage
 - cloud IAM governance
-- remote or non-loopback intake
+- raw remote intake bound on non-loopback interfaces without a separate review
+
+## UI handoff (headless / remote Web UI)
+
+When Hermes runs headless, desktop `webbrowser.open` fails. SecretBox may publish
+the **loopback** intake URL to a trusted local handoff bridge
+(`secretbox-ui-handoff`) over loopback HTTP with a shared secret. The user opens
+the bridge's public form index in their own browser. MCP still never returns
+bearer URLs to the agent. See
+[ADR-002](./decisions/ADR-002-ui-handoff-intake.md).
+
+Residual risk: the handoff bridge public page is a deliberate remote entry to
+loopback intake for the authenticated browser user of that host deployment.
+Harden with network firewall, reverse-proxy auth, and short TTL.
 
 ## Main risks
 
