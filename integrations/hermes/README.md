@@ -5,6 +5,41 @@ The preferred path uses SecretBox's local stdio MCP server: the trusted user
 fixes the workspace and host target policy once, then Hermes can open, check,
 and cancel browser-mediated intake without receiving a bearer URL or value.
 
+## Default workspace (host-wide)
+
+Unless a project explicitly needs its own secret root, register SecretBox once
+against the Hermes host default:
+
+```text
+~/.hermes/workspaces/default
+```
+
+Examples after expansion:
+
+| Host | Absolute workspace |
+|---|---|
+| root Hermes install | `/root/.hermes/workspaces/default` |
+| user install | `$HOME/.hermes/workspaces/default` |
+
+Create it once in a trusted terminal:
+
+```bash
+mkdir -p ~/.hermes/workspaces/default/secrets
+chmod 700 ~/.hermes/workspaces/default ~/.hermes/workspaces/default/secrets
+```
+
+Agent rule encoded in the skill:
+
+- if the user does **not** name another absolute workspace, always use the
+  pre-registered MCP workspace (the default above);
+- never ask for a workspace path on routine secret intake;
+- never pass `workspace_root` / `allowed_targets` in MCP requests;
+- if the user wants project-local secrets under `/path/to/project`, stop and
+  give a trusted-terminal re-registration command; do not reconfigure MCP from
+  chat.
+
+Default allowlist remains `.env`, `.env.*`, and `secrets/*` under that root.
+
 ## 1. Install SecretBox with MCP support
 
 Install the package in an environment visible to Hermes:
@@ -22,24 +57,72 @@ python -m pip install -e ".[mcp]"
 
 ## 2. Register the trusted MCP boundary
 
-Run this yourself in a trusted local terminal, outside an active Hermes chat:
+Run this yourself in a trusted local terminal, outside an active Hermes chat.
+
+### Host-wide default (recommended)
 
 ```bash
-hermes mcp add openagent-secretbox --command secretbox-mcp --args --workspace "/absolute/path/to/project"
+# resolve secretbox-mcp with `command -v secretbox-mcp` or the Hermes venv path
+hermes mcp add openagent-secretbox \
+  --command "$(command -v secretbox-mcp)" \
+  --args --workspace "$HOME/.hermes/workspaces/default"
+```
+
+Root Hermes installs commonly use:
+
+```bash
+hermes mcp add openagent-secretbox \
+  --command /usr/local/lib/hermes-agent/venv/bin/secretbox-mcp \
+  --args --workspace /root/.hermes/workspaces/default
+```
+
+### Project-local override (only when user insists)
+
+```bash
+hermes mcp add openagent-secretbox \
+  --command "$(command -v secretbox-mcp)" \
+  --args --workspace "/absolute/path/to/project"
 ```
 
 `--args` must be the final Hermes option. Everything after it is passed to
 `secretbox-mcp`. On Windows, an absolute executable and workspace are valid:
 
 ```powershell
-hermes mcp add openagent-secretbox --command "C:\path\to\secretbox-mcp.exe" --args --workspace "E:\path\to\project"
+hermes mcp add openagent-secretbox --command "C:\path\to\secretbox-mcp.exe" --args --workspace "$env:USERPROFILE\.hermes\workspaces\default"
+```
+
+### If `hermes mcp add` misparses `--workspace`
+
+Some Hermes CLI builds treat `--workspace` after `--args` as a Hermes flag and
+fail with `unrecognized arguments: --workspace`. In that case, write the entry
+directly into `~/.hermes/config.yaml` from a trusted terminal:
+
+```yaml
+mcp_servers:
+  openagent-secretbox:
+    command: /absolute/path/to/secretbox-mcp
+    args:
+      - --workspace
+      - /absolute/path/to/.hermes/workspaces/default
+    enabled: true
+    timeout: 120
+    connect_timeout: 60
+```
+
+Then:
+
+```bash
+hermes mcp test openagent-secretbox
 ```
 
 The server always authorizes `.env`, `.env.*`, and `secrets/*`. A trusted user
 may explicitly extend that startup policy with a repeated argument:
 
 ```bash
-hermes mcp add openagent-secretbox --command secretbox-mcp --args --workspace "/absolute/project" --allow-target "config/private.json"
+hermes mcp add openagent-secretbox \
+  --command "$(command -v secretbox-mcp)" \
+  --args --workspace "$HOME/.hermes/workspaces/default" \
+  --allow-target "config/private.json"
 ```
 
 Do not ask Hermes to run or modify these commands. The user-selected
@@ -201,13 +284,18 @@ permissions make it read-only.
 
 1. Hermes prepares a request object containing names, descriptions, relative
    targets, and conservative write policy only. It omits `workspace_root` and
-   `allowed_targets`.
+   `allowed_targets`. It does not ask for a workspace path when MCP is already
+   registered; writes land under the fixed host default unless the trusted user
+   re-registered a project path.
 2. Hermes calls `open_secret_intake`. The trusted MCP process applies its fixed
    workspace/allowlist and opens the one-time URL directly in the local browser.
 3. MCP returns only a non-secret intake id, redacted status, and expiry. It
    never returns the intake URL, token, session id, or submitted values.
 4. The user enters values in the browser. Hermes may call the status tool, or
    cancel the intake at the user's request.
+5. On success Hermes reports only names, relative targets, and redacted status.
+   Absolute location is implied by the registered workspace
+   (`~/.hermes/workspaces/default` by default).
 
 Cancellation is atomic only before secret application starts. If cancel returns
 `apply_in_progress`, do not retry or open a replacement intake; poll the existing
@@ -219,10 +307,14 @@ file contents into Hermes.
 ## Manual fallback
 
 When the MCP tools are not configured, the skill may create and validate a
-metadata-only request file. It prints this command but never executes it:
+metadata-only request file. Unless the user already named another absolute path,
+use the host default workspace. The skill prints this command but never executes
+it:
 
 ```bash
-secretbox serve --workspace "/absolute/project" --request "/absolute/request.json"
+secretbox serve \
+  --workspace "$HOME/.hermes/workspaces/default" \
+  --request "/absolute/request.json"
 ```
 
 The trusted user runs it in a separate local terminal. If browser auto-open

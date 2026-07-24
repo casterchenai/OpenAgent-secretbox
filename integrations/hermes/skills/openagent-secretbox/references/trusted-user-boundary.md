@@ -7,8 +7,10 @@ Read this reference before using SecretBox through Hermes Agent.
 ```text
 Trusted user terminal (outside Hermes)
   | registers secretbox-mcp with fixed --workspace/--allow-target policy
+  | preferred host-wide workspace: ~/.hermes/workspaces/default
   v
 Hermes Agent -> metadata-only open/status/cancel tool calls
+  | never chooses workspace; never asks for path unless user overrides policy
   v
 SecretBox MCP subprocess
   | validates against startup policy; URL stays inside subprocess
@@ -16,7 +18,7 @@ SecretBox MCP subprocess
   v
 Trusted browser: user enters values -> loopback SecretBox writer
   v
-Approved workspace targets
+Approved workspace targets (.env, .env.*, secrets/* under fixed root)
 
 SecretBox MCP -> Hermes: intake id and redacted status only
 ```
@@ -25,10 +27,31 @@ The MCP server never returns its intake URL, fragment token, session id, or
 submitted values through MCP. The agent request omits `workspace_root` and
 `allowed_targets`; startup configuration supplies those trusted controls.
 
+## Default workspace policy
+
+| Who | Workspace authority |
+|---|---|
+| Trusted user | Chooses absolute `--workspace` once when registering MCP |
+| Hermes / agent | Uses whatever workspace the MCP process already has |
+| Default recommendation | `~/.hermes/workspaces/default` for all sessions on a host |
+
+Unless the user explicitly directs a different absolute workspace and performs
+a trusted-terminal re-registration, agents must:
+
+1. assume the pre-registered MCP workspace is correct;
+2. not ask "which project path should I use?";
+3. not pass or invent `workspace_root` in tool arguments;
+4. report relative targets only (plus a one-line note of the default root when helpful).
+
+Manual fallback without MCP should also default to
+`~/.hermes/workspaces/default` unless the user already named another absolute
+path in the same turn.
+
 ## Manual fallback data flow
 
 ```text
 Hermes -> metadata-only request JSON and an unexecuted serve command
+  | default --workspace: ~/.hermes/workspaces/default (absolute form)
   v
 Trusted user terminal -> secretbox serve -> trusted local browser
   v
@@ -49,7 +72,9 @@ status. It may not register or reconfigure the MCP server.
 
 The local user is the policy authority. In a separate trusted terminal, the
 user installs SecretBox, verifies the executable, and registers MCP with an
-absolute `--workspace`. Only the user may add startup `--allow-target` values.
+absolute `--workspace` (prefer `~/.hermes/workspaces/default` expanded). Only
+the user may add startup `--allow-target` values or switch to a project-local
+workspace.
 
 SecretBox MCP is the value handler. It binds intake to loopback, opens the URL
 directly in the local browser, consumes the one-time session, applies
@@ -67,21 +92,27 @@ transition wins, MCP returns `apply_in_progress`; the write continues to a real
    `secretbox serve`; those commands establish or bypass trusted process policy.
 3. Do not pass `workspace_root` or `allowed_targets` in an MCP request. The
    request may declare only concrete relative write targets.
-4. Do not let Hermes receive, open, exchange, poll, or screenshot an intake URL.
+4. Do not solicit a workspace path when MCP is already registered, unless the
+   user is explicitly changing host policy.
+5. Do not let Hermes receive, open, exchange, poll, or screenshot an intake URL.
    MCP status polling uses only the non-secret `intake_id`.
-5. Do not send loopback intake URLs through gateway platforms or between hosts.
-6. Do not inspect target contents after apply. Use redacted MCP status or a
+6. Do not send loopback intake URLs through gateway platforms or between hosts.
+7. Do not inspect target contents after apply. Use redacted MCP status or a
    status-only user confirmation.
-7. Do not let an agent select startup `--allow-target`. Request metadata may
+8. Do not let an agent select startup `--allow-target`. Request metadata may
    select concrete targets only within the user-fixed host policy.
 
 ## Trusted registration checklist
 
-Before running `hermes mcp add` outside chat, verify:
+Before registering outside chat, verify:
 
 - `secretbox-mcp` is the expected installed OpenAgent SecretBox executable;
 - `--workspace` is the intended existing directory, not a link or junction;
-- `--args` is the final Hermes option and only reviewed server arguments follow;
+- for host-wide use, workspace is `~/.hermes/workspaces/default` (absolute);
+- for project-local use, workspace is that project's absolute root and the user
+  understands secrets will not land under the host default;
+- if `hermes mcp add --args --workspace ...` misparses flags on this Hermes
+  build, write the absolute command/args into `~/.hermes/config.yaml` instead;
 - any repeated `--allow-target` extension is necessary and narrowly scoped;
 - the probe discovers only open, status, and cancel tools;
 - `hermes mcp test openagent-secretbox` succeeds;
@@ -90,6 +121,25 @@ Before running `hermes mcp add` outside chat, verify:
 The default startup allowlist is `.env`, `.env.*`, and `secrets/*`. Request
 metadata can choose concrete targets inside it but cannot expand it. The MCP
 server also forces no-overwrite and disables persistent backup.
+
+### Recommended host-wide config
+
+```yaml
+mcp_servers:
+  openagent-secretbox:
+    command: /absolute/path/to/secretbox-mcp
+    args:
+      - --workspace
+      - /absolute/path/to/.hermes/workspaces/default
+    enabled: true
+```
+
+Create the default workspace once in a trusted terminal:
+
+```bash
+mkdir -p ~/.hermes/workspaces/default/secrets
+chmod 700 ~/.hermes/workspaces/default ~/.hermes/workspaces/default/secrets
+```
 
 ## What this boundary does not provide
 
@@ -107,6 +157,11 @@ secret after SecretBox writes it. For strict separation:
 - run SecretBox and the credential-consuming application under a trusted
   identity that can access those targets;
 - keep untrusted web, email, and gateway input out of the trusted process.
+
+Using the host default workspace improves agent ergonomics; it does not move
+secrets out of the Hermes OS identity. Project apps that must read secrets from
+their own tree need either a project-local MCP registration or a trusted user
+copy/link after apply.
 
 ## Exposure response
 
