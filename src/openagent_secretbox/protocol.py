@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn
 
+from .origin import normalize_portal_origin
+
 WRITER_STATUSES = frozenset({"applied", "noop", "partial", "blocked"})
 INTAKE_STATUSES = frozenset(
     {"awaiting_input", "applied", "failed", "cancelled", "expired"}
@@ -42,6 +44,7 @@ _MCP_FIELDS = frozenset(
         "status",
         "expires_at",
         "browser_opened",
+        "portal_url",
         "result",
         "error_code",
     }
@@ -164,6 +167,19 @@ def _timestamp(value: Any, path: str) -> str:
     except ValueError:
         _fail(f"{path} is not a real calendar timestamp")
     return text
+
+
+def _portal_url(value: Any, path: str) -> str:
+    """Accept only a fixed HTTPS origin, never a session-bearing URL."""
+
+    text = _string(value, path, max_length=2048)
+    try:
+        origin, _host, scheme = normalize_portal_origin(text)
+    except ValueError:
+        _fail(f"{path} must be a fixed HTTPS origin without credentials or a route")
+    if scheme != "https":
+        _fail(f"{path} must be a fixed HTTPS origin without credentials or a route")
+    return origin
 
 
 def _metadata_name(value: Any, path: str) -> str:
@@ -429,18 +445,24 @@ def normalize_mcp_result(value: Mapping[str, Any]) -> dict[str, Any]:
         normalized["expires_at"] = _timestamp(item["expires_at"], "mcp_result.expires_at")
     if "browser_opened" in item:
         browser_opened = item["browser_opened"]
-        if browser_opened is not True:
-            _fail("mcp_result.browser_opened must be true when present")
-        normalized["browser_opened"] = True
+        if not isinstance(browser_opened, bool):
+            _fail("mcp_result.browser_opened must be boolean when present")
+        normalized["browser_opened"] = browser_opened
+    if "portal_url" in item:
+        normalized["portal_url"] = _portal_url(item["portal_url"], "mcp_result.portal_url")
     terminal_only = {"result", "error_code"}
     if status == "awaiting_input":
         if "expires_at" not in item:
             _fail("awaiting_input MCP result requires expires_at")
         if terminal_only & set(item):
             _fail("awaiting_input MCP result may not contain terminal fields")
+        if item.get("browser_opened") is False and "portal_url" not in item:
+            _fail("remote awaiting_input MCP result requires portal_url")
+        if "portal_url" in item and item.get("browser_opened") is not False:
+            _fail("portal_url requires browser_opened=false")
         return normalized
-    if "browser_opened" in item:
-        _fail("terminal MCP results may not contain browser_opened")
+    if "browser_opened" in item or "portal_url" in item:
+        _fail("terminal MCP results may not contain browser delivery fields")
     if status == "applied":
         if "result" not in item or "error_code" in item:
             _fail("applied MCP result requires writer result and no error_code")

@@ -18,6 +18,7 @@ from openagent_secretbox.server import (
     InvalidState,
     InvalidToken,
     SessionStore,
+    UnknownSession,
     create_app,
     serve_once,
 )
@@ -115,6 +116,20 @@ def test_session_expires_and_cannot_be_exchanged() -> None:
     assert store.get(handle.session_id)["status"] == "expired"
 
 
+def test_discard_terminal_never_removes_an_active_session() -> None:
+    store = SessionStore(ttl=60)
+    pending = store.create(REQUEST)
+    assert store.discard_terminal(pending.session_id) is False
+    assert store.get(pending.session_id)["status"] == "pending"
+
+    cancelled = store.create(REQUEST)
+    store.cancel_pending(cancelled.session_id)
+    assert store.discard_terminal(cancelled.session_id) is True
+    assert store.discard_terminal(cancelled.session_id) is False
+    with pytest.raises(UnknownSession):
+        store.get(cancelled.session_id)
+
+
 def test_submitted_session_ignores_ttl_and_reaches_one_terminal_state() -> None:
     now = [100.0]
     apply_started = threading.Event()
@@ -155,6 +170,7 @@ def test_submitted_session_ignores_ttl_and_reaches_one_terminal_state() -> None:
         assert owner_cancel["status"] == "submitted"
         assert "error_code" not in during_apply
         assert store.all_terminal(handle.session_id) is False
+        assert store.discard_terminal(handle.session_id) is False
         with pytest.raises(InvalidState):
             store.cancel(
                 handle.session_id,
@@ -181,6 +197,9 @@ def test_submitted_session_ignores_ttl_and_reaches_one_terminal_state() -> None:
     final = store.get(handle.session_id)
     assert final["status"] == "applied"
     assert "error_code" not in final
+    assert store.discard_terminal(handle.session_id) is True
+    with pytest.raises(UnknownSession):
+        store.get(handle.session_id)
 
 
 def test_owner_cancel_wins_atomically_before_submit_transition(

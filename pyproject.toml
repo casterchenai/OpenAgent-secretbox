@@ -51,6 +51,7 @@ dev = [
 [project.scripts]
 secretbox = "openagent_secretbox.cli:main"
 secretbox-mcp = "openagent_secretbox.mcp_server:main"
+secretbox-worker-mcp = "openagent_secretbox.linux_worker.mcp_bridge:main"
 
 [tool.hatch.version]
 path = "src/openagent_secretbox/__init__.py"

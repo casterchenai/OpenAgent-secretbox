@@ -1,782 +1,256 @@
 # OpenAgent SecretBox
 
-**Secure secret intake for AI agents — let users provide API keys, environment variables, and private files without exposing secrets in chat.**
+## 受限 Linux 执行 Worker
 
-OpenAgent SecretBox is a local-first credential intake gateway for AI-agent workflows.
+新增 **Phase 2 真实 Linux 容器执行链路**：独立凭据服务、mTLS 任务 API、
+固定目标和操作白名单、持久防重放、超时、取消、重启恢复及独立恢复确认。
+在本机 Docker 的隔离 PostgreSQL 中实际执行连接检查、`pg_restore` 和计数验证，
+不复用现有 Supabase 容器或凭据。另提供 `secretbox-linux-worker` MCP 适配器，
+不再依赖本机凭据 intake 来完成执行任务。
 
-It solves a practical contradiction in agent-assisted development:
+业务场景是让 AI 申请“使用服务端凭据执行一个批准的隔离恢复任务”，
+而不是让 AI 读取密码或执行任意 SSH 命令。**当前恢复适配器只支持审核过的
+合成测试备份，不等于实际 ECS/RDS 或任意业务备份已经验收。**
+参见 [真实部署与可调用接口](docs/remote-worker-deployment.md)、
+[可执行验收清单](docs/remote-worker-runbook.md)、
+[协议](docs/remote-worker-protocol.md)、[威胁模型](docs/remote-worker-threat-model.md)、
+[操作约束](docs/remote-worker-operations.md)和[凭据边界](docs/remote-worker-secrets.md)。
 
-> Users should not paste secrets into chat, but agents often need secrets to configure projects, deploy services, or connect integrations.
+**让用户在 AI 聊天之外输入 API Key、环境变量和私密文件，再由 SecretBox 精准写入 Agent 所在的项目。**
 
-OpenAgent SecretBox gives the agent a safe protocol:
+Agent 只声明“需要什么、写到哪里”，用户在独立页面中填写或上传。SecretBox
+按受信策略写入目标文件，Agent 只收到脱敏状态，不会收到用户提交的值或文件内容。
 
-1. The agent declares what secrets it needs.
-2. The user enters or uploads those secrets in a separate loopback intake window.
-3. SecretBox writes them to approved local targets using safe merge rules.
-4. The agent receives only a redacted result: what was written, where it was written, and whether anything is missing or blocked.
+当前代码是 `0.1.0a1` 预发布版本，已经支持本机单次表单和远端固定 Gateway。
+项目尚未经过独立安全审计，也没有可用的 PyPI 发布或 GitHub Release；请从已审查的
+源码修订安装，不要把它作为生产凭据的唯一安全控制。
 
-The AI agent does **not** need to see the secret values.
+## 先判断你的使用场景
 
----
+| 你的实际情况 | 应该使用 | 用户体验 | 网络要求 |
+|---|---|---|---|
+| Codex App、Claude Code App 或其他桌面 Agent 与项目在同一台电脑 | **本机模式** | Agent 知道深层目录；浏览器自动打开 `127.0.0.1` 单次表单，用户只需填写或上传 | 不开放公网端口 |
+| Hermes 在阿里云等远端服务器，用户通过 Web UI、飞书或微信对话 | **固定 Gateway 模式** | 聊天只给出一个固定 HTTPS 门户；登录后选择待处理请求，文件直接写入服务器项目 | 复用现有公网 `443`；内部固定端口只监听 `127.0.0.1` |
+| 平台本身提供环境变量表单和精准文件上传，例如托管沙箱 | **优先使用平台原生能力** | 由平台完成隔离和注入 | 通用托管沙箱适配是后续阶段 |
+| 纯 CLI 用户愿意自己编辑文件和路径 | **通常不需要 SecretBox** | CLI 主要用于受信部署、诊断和集成，不是产品的主要交互界面 | 取决于部署方式 |
 
-## Project status
+远端模式不会为每次请求新开公网端口，也不需要反复修改云安全组。每个请求只是同一
+Gateway 中的一条内存记录；用户始终访问同一个门户，例如
+`https://secretbox.example.com`。
 
-This repository now contains a local-only `0.1.0a1` pre-release MVP. It
-includes strict request validation, merge-only writers, path policy checks,
-redacted status data, a loopback intake server, and an installable CLI.
+## 它解决什么问题
 
-It has not received an independent security assessment. Remote intake is not
-enabled by the CLI; the supported server binds to `127.0.0.1` only.
+典型任务是 Agent 需要把支付证书写入服务器上的
+`config/payment/certs/apiclient_key.pem`，并把 API Key 合并到 `.env.local`。
+用户不必寻找 Agent 的安装目录、SSH 编辑文件或处理权限，只需在 SecretBox 页面中：
 
-Install a development checkout and validate an example:
+1. 核对工作区、变量名、文件目标和 merge-only 策略。
+2. 在聊天之外输入值或上传文件。
+3. 提交一次；页面明确显示成功、冲突、取消、过期或已使用状态。
+4. 让 Agent 根据脱敏结果继续任务。
+
+默认写入策略：
+
+- 环境变量只合并缺失项，不覆盖不同的已有值；
+- 文件只写入受信 allowlist 内的相对路径；
+- 拒绝绝对路径、`..`、符号链接、Windows reparse point 和不安全硬链接；
+- 目标文件采用 POSIX `0600` 或 Windows 当前用户专用 ACL；
+- 单个目标原子替换，但多个目标之间不是分布式事务；
+- 默认不创建持久备份，避免复制另一份秘密。
+
+## 安全边界
+
+以下内容绝不能进入 Agent 聊天、模型上下文或 Agent 可见结果：
+
+- 用户提交的值、上传文件内容及其可逆或编码版本；
+- Gateway Owner Key；
+- 浏览器 session ID、Cookie、CSRF token 或一次性 bearer；
+- 带 intake 路径、请求 ID、查询参数或 fragment 的 URL。
+
+远端 Agent 可以返回固定的 `portal_url`，但它只能是 HTTPS origin 根地址，例如
+`https://secretbox.example.com`。它是公共入口定位符，不是授权凭据。MCP 的
+`intake_id` 只是进程内轮询/取消句柄，绝不能拼进 URL 或当作浏览器凭据。
+
+SecretBox 的核心目标是阻止秘密经过聊天传递，并减少误写。它**不能**阻止拥有同一
+OS 用户无限制 shell 权限的 Agent 在写入后读取目标文件，也不能抵御主机、项目依赖
+或运行时已经被攻破。需要更强隔离时，应使用独立 OS 用户、容器边界、受限运行身份
+或外部 KMS/Vault。
+
+## 从源码安装
+
+当前没有可声明为已发布的 PyPI 包或 GitHub Release。受信管理员应先审查并固定一个
+Git commit，然后在运行 Agent 的 Python 环境中安装源码：
 
 ```bash
-uv sync --extra dev
-uv run secretbox --json validate examples/openai.request.json
+git clone https://github.com/casterchenai/OpenAgent-secretbox.git
+cd OpenAgent-secretbox
+git checkout <reviewed-full-commit-sha>
+python -m pip install ".[mcp]"
+secretbox-mcp --help
 ```
 
-Start local intake directly:
-
-```bash
-uv run secretbox serve \
-  --workspace /path/to/project \
-  --request examples/openai.request.json
-```
-
-If the request declares `workspace_root`, it must match `--workspace`. By default, SecretBox
-opens the one-time intake URL in the user's browser and does not print the bearer
-token. The token is carried in a URL fragment, cleared before exchange, and never
-sent in an HTTP request path. `--no-open` prints that sensitive URL for headless use; never paste it
-into chat, logs, issues, or shell history.
-
----
-
-## Why this exists
-
-Today, many agent workflows still rely on unsafe patterns:
-
-```text
-User: Here is my OPENAI_API_KEY=sk-...
-Agent: I will add it to your .env file.
-```
-
-That creates several problems:
-
-- secrets enter the chat transcript
-- secrets enter the LLM context window
-- secrets may be stored by the chat provider
-- secrets may be replayed in future agent context
-- agents may accidentally print them in logs or summaries
-- users are taught the wrong habit
-
-But the opposite instruction is also incomplete:
-
-```text
-Do not paste secrets into chat.
-```
-
-That is safe advice, but not enough. Many users do not know how to SSH into a server, edit `.env` files, set permissions, merge without overwriting, or upload PEM files correctly.
-
-OpenAgent SecretBox provides the missing middle layer.
-
----
-
-## Core idea
-
-OpenAgent SecretBox is not just a password manager and not just a file uploader.
-
-It is a **secret intake broker for AI agents**.
-
-The agent can say:
-
-> I need these secret names and private files to complete the setup.
-
-The user provides values through a dedicated intake UI.
-
-SecretBox applies those values according to a strict policy:
-
-- no secret values returned to the agent
-- no overwrite by default
-- merge-only `.env` updates
-- conflict detection
-- target path allowlists
-- atomic replacement without persistent backup by default
-- redacted status output; persistent audit logging remains future work
-- restrictive file permissions
-
----
-
-## The boundary
-
-OpenAgent SecretBox mainly protects against accidental exposure through the AI conversation layer.
-
-It helps keep secrets out of:
-
-- chat messages
-- LLM context
-- agent summaries
-- generated docs
-- logs
-- git commits
-
-It does **not** magically solve every secret-management problem.
-
-If an agent has unrestricted shell access to the same machine and the same user account, it may still be able to read files after they are written. Stronger protection requires additional isolation, such as:
-
-- separate OS users
-- filesystem ACLs
-- container boundaries
-- process-level secret injection
-- cloud KMS / HashiCorp Vault / AWS Secrets Manager / GCP Secret Manager
-
-OpenAgent SecretBox starts with a realistic and valuable goal:
-
-> Keep secrets out of AI chat while still letting agents finish configuration work.
-
----
-
-## Architecture overview
-
-```text
-+---------------------+
-|      AI Agent       |
-|---------------------|
-| Declares required   |
-| env vars and files  |
-|                     |
-| Receives only       |
-| redacted status     |
-+----------+----------+
-           |
-           | secret request schema
-           v
-+----------+----------+
-|  OpenAgent SecretBox|
-|---------------------|
-| one-time sessions   |
-| policy engine       |
-| env merge writer    |
-| file writer         |
-+----------+----------+
-           ^
-           |
-           | user submits values
-+----------+----------+
-|  Loopback Intake UI |
-|---------------------|
-| paste env vars      |
-| paste API keys      |
-| upload PEM/JSON     |
-| show write policy   |
-+----------+----------+
-           |
-           | controlled writes
-           v
-+----------+----------+
-|   Target Workspace  |
-|---------------------|
-| .env.local          |
-| secrets/*.pem       |
-| config/*.json       |
-+---------------------+
-```
-
----
-
-## Agent workflow
-
-### 1. Agent creates a secret request
-
-The agent prepares a schema describing the secrets it needs.
-
-Example:
-
-```json
-{
-  "request_id": "wechat-pay-setup",
-  "title": "WeChat Pay setup",
-  "workspace_root": "/opt/my-app",
-  "needs": [
-    {
-      "type": "env",
-      "name": "WECHAT_PAY_MCH_ID",
-      "required": true,
-      "description": "WeChat Pay merchant ID"
-    },
-    {
-      "type": "env",
-      "name": "WECHAT_PAY_API_V3_KEY",
-      "required": true,
-      "description": "WeChat Pay API v3 key"
-    },
-    {
-      "type": "file",
-      "name": "apiclient_key.pem",
-      "required": true,
-      "target": "secrets/apiclient_key.pem",
-      "description": "Merchant private key PEM file"
-    }
-  ],
-  "write_policy": {
-    "env_file": ".env.local",
-    "mode": "merge_only",
-    "no_overwrite": true,
-    "backup": false
-  }
-}
-```
-
-### 2. SecretBox opens an intake session
-
-A local-only intake URL is generated. The session id is sent in the path while
-the bearer token remains in the browser fragment:
-
-```text
-http://127.0.0.1:17321/intake/ses_random#token=one-time-token
-```
-
-The token should be:
-
-- high entropy
-- bound to one request
-- short-lived
-- consumed atomically during the initial session exchange
-
-### 3. User enters values outside the chat
-
-The user can:
-
-- paste individual API keys
-- paste `.env`-style variables
-- upload private files such as `.pem`, `.json`, `.p12`
-- review declared targets and the enforced write policy
-- cancel the session without submitting values
-
-Values go directly to SecretBox, not to the chat.
-
-### 4. SecretBox writes safely
-
-For environment files:
-
-- parse existing `.env` file if present
-- preserve existing comments and unrelated values where possible
-- append missing values
-- skip identical values
-- block changed values; the alpha CLI has no overwrite approval path
-- avoid persistent backups, which would create another secret copy
-
-For uploaded files:
-
-- normalize and validate paths
-- reject path traversal
-- restrict writes to allowed targets
-- write with restrictive permissions
-- avoid echoing content in logs or responses
-
-### 5. Agent receives redacted result
-
-Example:
-
-```json
-{
-  "request_id": "wechat-pay-setup",
-  "status": "applied",
-  "written": [
-    {
-      "type": "env",
-      "name": "WECHAT_PAY_MCH_ID",
-      "target": ".env.local",
-      "action": "added"
-    },
-    {
-      "type": "env",
-      "name": "WECHAT_PAY_API_V3_KEY",
-      "target": ".env.local",
-      "action": "added"
-    },
-    {
-      "type": "file",
-      "name": "apiclient_key.pem",
-      "target": "secrets/apiclient_key.pem",
-      "action": "created",
-      "mode": "0600"
-    }
-  ],
-  "conflicts": [],
-  "missing": []
-}
-```
-
-No secret value appears in this response.
-
----
-
-## Command-line interface
-
-Validate request metadata without accepting secret values:
-
-```bash
-secretbox --json validate ./secret-request.json
-```
-
-Create a local metadata-only registry entry. `request create` is an alias:
-
-```bash
-secretbox create ./secret-request.json
-secretbox request create ./secret-request.json
-```
-
-This registry is optional in `0.1.0a1`. It is not connected to a running
-`serve` process: `status` reports only the metadata record created by `create`,
-while `serve` waits and returns its own final redacted result.
-
-Start a one-time loopback intake session:
-
-```bash
-secretbox serve \
-  --workspace /path/to/project \
-  --request ./secret-request.json \
-  --ttl 600
-```
-
-The trusted CLI policy authorizes `.env`, `.env.*`, and `secrets/*` by default.
-Use a repeated `--allow-target PATTERN` option to authorize an additional target;
-request-provided allowlists can narrow access but cannot expand this host policy.
-Uploads are limited to 10 MiB per declared file and 16 MiB for the complete HTTP request.
-
-The person running `secretbox serve` is the policy authority. Do not let an
-untrusted agent choose `--workspace` or `--allow-target`. This local MVP reduces
-chat leakage and accidental writes; it does not isolate an agent that already has
-unrestricted shell access as the same OS user.
-
-```bash
-secretbox status <request-id>
-```
-
-```bash
-secretbox doctor --workspace /path/to/project
-```
-
-Add `--json` before or after a command for machine-readable output. Unsupported
-or invalid operations return a non-zero exit code. Secret values are never accepted
-as command-line arguments.
-
-With `--json --no-open`, stdout is a two-line JSON event stream: the first event
-is `awaiting_input` and contains the explicitly marked sensitive bearer URL; the
-second is the final redacted `applied`, `failed`, or `expired` result. Do not send
-the first event to shared logs.
-
-### MCP agent integration
-
-Install the optional MCP support:
+开发者需要修改源码时，可以使用 editable 安装或仓库锁定环境：
 
 ```bash
 python -m pip install -e ".[mcp]"
 ```
 
-Configure an MCP client to start SecretBox over stdio with a workspace chosen by
-the trusted user:
+```bash
+uv sync --extra dev
+uv run pytest
+```
 
-```json
-{
-  "mcpServers": {
-    "openagent-secretbox": {
-      "command": "secretbox-mcp",
-      "args": ["--workspace", "/absolute/path/to/project"]
-    }
-  }
+## Hermes Agent Skill 一键安装
+
+安装 Skill 只负责教 Hermes 正确调用已经配置好的 SecretBox MCP；它不会安装 Python
+包、创建 Owner Key、选择工作区、扩大 allowlist 或开放网络端口。
+
+当前仓库的一键 Skill 安装明确支持 Hermes。Codex App、Claude Code App 和其他 Agent
+可以使用同一 MCP tools，但各客户端的自动安装与权限配置尚未作为通用安装器发布。
+
+审查目标源码修订后，用一条命令安装完整 Hermes Skill：
+
+```bash
+hermes skills install "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md" --category security
+```
+
+正式部署时应把 URL 中的 `main` 替换成已审查的完整 Git commit SHA，然后执行
+`/reload-skills`。本地源码树也可以作为 Hermes 的 `external_dirs`：
+
+```yaml
+skills:
+  external_dirs:
+    - /absolute/path/to/OpenAgent-secretbox/integrations/hermes/skills
+```
+
+完整安装、MCP 注册和兼容性说明见
+[Hermes integration](./integrations/hermes/README.md)。
+
+## 受信管理员设置
+
+这些命令决定 SecretBox 可以写哪个工作区和哪些目标，必须由服务器或电脑的所有者
+在 Agent 聊天之外执行。不要让 Agent 生成、读取或修改这些启动参数。
+
+### 本机 App
+
+把 MCP server 注册到本机 Agent，并由受信用户固定工作区：
+
+```bash
+secretbox-mcp --workspace /absolute/path/to/project
+```
+
+默认授权 `.env`、`.env.*` 和 `secrets/*`。只有在应用确实需要时，才在受信配置中用
+重复的 `--allow-target PATTERN` 增加经过审查的目标。
+
+本机 `open_secret_intake` 会直接打开 loopback 浏览器页面，返回
+`browser_opened: true`，不会把 URL 交给 Agent。
+
+### 远端 Hermes 固定 Gateway
+
+先在服务器上生成 Owner Key。命令拒绝覆盖已有文件，限制为 owner-only 权限，而且
+不会打印 Key：
+
+```bash
+secretbox gateway keygen --output /path/to/owner.key
+```
+
+Gateway 启动时只接受已经是 owner-only 的 Key 文件；如果权限过宽会直接拒绝启动，
+不会边修复权限边继续信任一个可能已经泄露的 Key。
+
+然后用固定工作区、HTTPS origin、loopback 地址、内部端口和 Owner Key 启动 MCP：
+
+```bash
+secretbox-mcp \
+  --workspace /srv/project \
+  --gateway-public-origin https://secretbox.example.com \
+  --gateway-bind 127.0.0.1 \
+  --gateway-port 17321 \
+  --gateway-owner-key-file /path/to/owner.key
+```
+
+Gateway 是一个可同时承载多个请求的长驻监听器。它只允许绑定
+`127.0.0.1`；不要改成 `0.0.0.0`，也不要在云安全组中开放 `17321`。
+
+使用现有 Caddy 或 Nginx 在公网 `443` 终止 TLS，并只把专用域名转发到内部端口。
+最小 Caddy 示例：
+
+```caddyfile
+secretbox.example.com {
+    reverse_proxy 127.0.0.1:17321
 }
 ```
 
-The server exposes three tools:
+反向代理必须保留配置的 Host/Origin，关闭请求正文、Cookie 和 Authorization 日志，
+限制请求体并对登录入口限速。SecretBox 不自动配置 DNS、TLS、云防火墙或反向代理，
+也不信任任意 `Forwarded` / `X-Forwarded-*` 头。
 
-| Tool | Purpose |
+远端 `open_secret_intake` 返回 `browser_opened: false` 和固定 HTTPS
+`portal_url`。用户用 Owner Key 登录后才能看到请求列表；未认证的链接预览不能查看
+或消费请求。Owner 登录会话和待处理请求保存在内存中，Gateway 重启后失效。
+
+## Agent 的日常行为
+
+配置完成后，Agent 只使用三个 MCP tools：
+
+| Tool | 作用 |
 |---|---|
-| `open_secret_intake` | Validate metadata and open the one-time form directly in the local browser |
-| `get_secret_intake_status` | Return lifecycle state and a structured, redacted write result |
-| `cancel_secret_intake` | Atomically cancel before secret application starts |
+| `open_secret_intake` | 提交不含秘密的请求元数据并打开本机页面，或创建远端待处理请求 |
+| `get_secret_intake_status` | 获取生命周期状态和脱敏写入结果 |
+| `cancel_secret_intake` | 在写入开始前原子取消 |
 
-The MCP process fixes `--workspace`, the host target allowlist, and the maximum
-active intake count at startup. Tool arguments cannot change those controls.
-The open tool returns an opaque MCP intake handle for status and cancellation,
-but never returns the browser session id, bearer URL, URL fragment, or token.
-Browser launch failure closes the listener and returns a stable error code.
-
-TTL limits how long a user may begin submission. Once secret application has
-started, it runs to an authoritative `applied` or `failed` result and cannot be
-safely interrupted. A concurrent cancel returns `apply_in_progress`; poll status
-for the real terminal result. SecretBox never reports `cancelled` while writes
-may still complete.
-
-`--allow-target` expands write authority and therefore belongs only in
-user-reviewed MCP startup configuration. Do not let an agent construct the MCP
-server command or pass secret values in request metadata. The stdio process
-reserves stdout for MCP protocol frames and closes all active listeners on exit.
-
-See [the result protocol](./docs/result-protocol.md), its
-[JSON Schema](./schemas/result-v1.json), and the
-[Hermes integration](./integrations/hermes/README.md). The sensitive bootstrap
-event emitted by CLI `--no-open --json` is deliberately outside the agent-safe
-result protocol.
-
-Later versions may support controlled command execution:
-
-```bash
-secretbox run --env .env.local -- npm run deploy
-```
-
-In that mode, secrets are injected into a child process but are still not printed back to the agent.
-
----
+Agent 可以声明公开名称、说明、是否必填和相对目标，但不能更改工作区、host allowlist、
+Gateway origin、监听地址、端口或 Owner Key。用户也不应把任何秘密作为聊天回复发送给
+Agent。
 
-## Write policy
-
-OpenAgent SecretBox should default to conservative behavior.
-
-`0.1.0a1` guarantees atomic replacement per target file, not a distributed
-transaction across several targets. If a later target is blocked after an earlier
-write succeeds, the result is explicitly `partial` and the intake UI does not
-report success.
-
-### Environment files
+如果取消与提交并发，写入开始后会返回 `apply_in_progress`；Agent 必须继续轮询，直到
+得到权威的 `applied` 或 `failed`，不能把它误报为 `cancelled`。
 
-| Situation | Default behavior |
-|---|---|
-| variable does not exist | add it |
-| variable exists with same value | skip |
-| variable exists with different value | block and report conflict |
-| variable exists but is empty | block and report conflict |
-| multi-line secret | prefer file write plus `*_PATH` env var |
-
-### Files
-
-| Situation | Default behavior |
-|---|---|
-| target file does not exist | create with restrictive permissions |
-| target file exists with identical content | verify/repair owner-only permissions, then skip |
-| target file exists with different content | block in the alpha CLI |
-| target path escapes workspace | reject |
-| target path is not allowlisted | reject |
-| upload exceeds size limit | reject |
-
----
-
-## Path policy
-
-A request describes desired targets but does not authorize them. The trusted CLI
-policy defines where SecretBox may write.
-
-Example host authorization:
-
-```bash
-secretbox serve --workspace /opt/my-app --request request.json \
-  --allow-target "config/*.json"
-```
+请求结构和返回协议见 [request schema](./docs/request-schema.md)、
+[result protocol](./docs/result-protocol.md) 和
+[JSON Schema](./schemas/result-v1.json)。架构决策见
+[local-first ADR](./docs/decisions/ADR-001-local-first-secret-intake.md) 与
+[fixed Gateway ADR](./docs/decisions/ADR-002-fixed-remote-gateway.md)。
 
-Rules:
+## 用户验收清单
 
-- all relative paths are resolved under `workspace_root`
-- absolute targets are always rejected
-- `..` path traversal is rejected after normalization
-- symlinks, Windows reparse points/junctions, and hard-linked files are rejected
+所有验收只使用可删除的假 Key 和测试文件，结束后清理目标内容、浏览器登录和测试请求。
 
----
-
-## Audit logs
+### 本机 Codex / Claude App
 
-Persistent audit logging is not implemented in `0.1.0a1`. A future audit backend
-must use an allowlisted metadata schema and never log intake bodies or values.
+- [ ] 让 Agent 申请一个假环境变量和假证书，不在聊天中提供值。
+- [ ] 确认浏览器自动打开 `127.0.0.1` 或 `localhost`，聊天中没有 intake URL、token 或 session ID。
+- [ ] 确认页面醒目说明只能提交一次，并在提交前显示准确工作区、相对目标和 merge-only 策略。
+- [ ] 提交后确认页面明确显示成功且不回显值或文件内容；刷新或后退不会重复写入，并提示需向 Agent 重新申请。
+- [ ] 预置一个不同值再提交同名变量，确认返回 conflict/blocked，旧值未被覆盖且没有持久备份。
+- [ ] 确认 Agent 只报告名称、相对目标、动作和状态，然后删除所有测试值与文件。
 
-Example:
+### 远端 Hermes / 飞书 / 微信
 
-```json
-{
-  "time": "2026-07-23T15:30:12+08:00",
-  "request_id": "wechat-pay-setup",
-  "workspace_root": "/opt/my-app",
-  "actions": [
-    {
-      "type": "env",
-      "name": "WECHAT_PAY_MCH_ID",
-      "target": ".env.local",
-      "action": "added"
-    },
-    {
-      "type": "file",
-      "name": "apiclient_key.pem",
-      "target": "secrets/apiclient_key.pem",
-      "action": "created",
-      "mode": "0600"
-    }
-  ]
-}
-```
-
-Audit logs must never include:
-
-- API key values
-- private key bodies
-- full bearer tokens
-- secret file contents
-- raw uploaded request bodies
-
----
-
-## Modes
-
-### Local mode
-
-Best for local development.
-
-```text
-Agent starts SecretBox on localhost.
-User opens a browser window.
-SecretBox writes into the local project workspace.
-```
-
-### Remote server mode
-
-Remote intake is not implemented or supported by the current CLI. The following
-describes a future deployment mode and must not be treated as an operating guide.
-
-```text
-Agent starts a temporary SecretBox intake service on the server.
-User receives a one-time URL.
-User uploads or pastes secrets.
-SecretBox writes directly on the server.
-The intake service shuts down after completion or TTL expiry.
-```
-
-Remote mode needs stricter protection:
-
-- one-time token
-- short TTL
-- HTTPS required
-- no request-body logging
-- upload size limits
-- bind to expected host/interface
-- optional reverse tunnel or gateway integration
-
-### Agent platform integration mode
-
-Best for AI platforms and agent UIs.
-
-```text
-The agent platform hosts the intake UI.
-SecretBox exposes a controlled backend API.
-The agent can create requests and poll status.
-The user provides values outside the chat message stream.
-```
-
-This can later integrate with platforms such as Hermes Agent, MCP-compatible agents, CLI agents, IDE agents, or hosted agent dashboards.
-
----
-
-## Threat model
-
-### Protected against
-
-- users accidentally pasting secrets into AI chat
-- agents accidentally repeating secrets in summaries
-- secrets appearing in generated README files
-- simple `.env` overwrite mistakes
-- path traversal in upload targets
-- accidental commits of common secret files through `.gitignore`
-
-### Not fully protected against
-
-- compromised host machine
-- malicious agent with unrestricted shell access
-- malicious project code that prints env vars
-- secret exfiltration by dependencies during runtime
-- terminal history or process list leaks outside SecretBox control
-- cloud provider or operating system compromise
-
-### Future hardening options
-
-- separate `secretbox` OS user
-- separate `agent` OS user
-- write secrets readable only by app runtime user
-- use Unix sockets with access control
-- encrypted-at-rest local vault
-- pass secrets only via subprocess environment
-- KMS backend support
-- hardware-backed secure storage where available
+- [ ] 确认公网只开放现有 HTTPS `443`，`17321` 只在服务器 `127.0.0.1` 监听。
+- [ ] 连续创建两个请求，确认两次聊天只出现同一个 HTTPS portal root，没有 path、query、fragment、intake ID 或 bearer。
+- [ ] 未登录或让链接预览访问门户，确认看不到请求且不会消费请求；错误 Owner Key 只显示通用错误。
+- [ ] 登录后确认可以区分多个待处理请求，并在打开前看到正确标题；打开后核对服务器工作区和精确目标。
+- [ ] 上传一个假文件到已授权的多层目标，确认用户无需寻找服务器路径且文件应用 owner-only 权限。
+- [ ] 分别验证成功后刷新、重复打开、取消、短 TTL 过期和 Gateway 重启，页面均给出清晰状态且不会重复写入。
+- [ ] 确认 Hermes、聊天、MCP 输出、代理日志和反向代理日志均不含测试值、文件正文、Owner Key 或浏览器凭据。
+- [ ] 通过受信管理员路径删除测试目标，退出门户并撤销测试 Owner Key。
 
----
+更完整的远端阶段用例见
+[remote Gateway acceptance](./docs/acceptance/remote-gateway.md)。
 
-## MVP roadmap
+## 项目状态与后续方向
 
-### Phase 0 — Documentation and design
+当前源码已经包含：严格请求校验、merge-only writer、路径策略、本机单次 intake、MCP
+集成、固定多会话 Gateway、Owner 认证和关闭字段集的脱敏结果协议。
 
-- [x] Define project purpose
-- [x] Define core architecture
-- [x] Define safety boundary
-- [x] Define MVP behavior
-- [x] Add ADRs for key security decisions
+后续方向包括托管沙箱适配、外部 KMS/Vault backend、独立 OS 身份隔离、上传类型策略、
+持久化审计元数据以及独立安全审计。路线图不改变当前边界：SecretBox 负责让秘密绕开
+Agent 聊天，不承诺对同用户无限制 Agent 隐藏已经写入磁盘的内容。
 
-### Phase 1 — Python single-file prototype
+## Security and license
 
-- [x] Parse request schema JSON
-- [x] Start loopback-only HTTP intake server
-- [x] Generate one-time token
-- [x] Render intake form
-- [x] Accept declared env values and file content
-- [x] Write `.env.local` with merge-only behavior
-- [x] Write declared private files under allowlisted targets
-- [x] Apply POSIX `0600` or an explicit current-user Windows DACL
-- [x] Generate redacted status JSON
-- [x] Auto-shutdown after success or TTL
+部署前请阅读 [Security Policy](./SECURITY.md) 和
+[Threat Model](./docs/threat-model.md)。漏洞请使用 GitHub private security advisory，
+不要在公开 issue 中提交凭据、日志、bearer URL 或截图。
 
-### Phase 2 — CLI package
-
-- [x] `secretbox request create`
-- [x] `secretbox serve`
-- [x] `secretbox status`
-- [x] `secretbox doctor`
-- [x] installable Python package
-- [x] tests for request schema, env merge, path policy, server, and CLI
-
-### Phase 3 — Agent integration
-
-- [x] agent-facing request schema examples
-- [x] Hermes skill integration
-- [x] MCP server or tool wrapper
-- [x] structured redacted result protocol
-- [x] examples for common services: OpenAI, Anthropic, Supabase, Stripe, WeChat Pay
-
-### Phase 4 — Hardening
-
-- [ ] encrypted local request store
-- [x] restrictive browser security headers
-- [x] CSRF and loopback Host/Origin protection
-- [ ] upload MIME and extension policies
-- [x] symlink and Windows reparse-point rejection
-- [x] Windows owner-only DACL behavior
-- [ ] remote HTTPS deployment guide
-- [ ] optional OS-user isolation guide
-
----
-
-## Example use cases
-
-### API key setup
-
-The agent needs:
-
-```text
-OPENAI_API_KEY
-ANTHROPIC_API_KEY
-SUPABASE_SERVICE_ROLE_KEY
-```
-
-SecretBox writes them to `.env.local` without ever returning the values to the agent.
-
-### Private key upload
-
-The user uploads:
-
-```text
-apiclient_key.pem
-```
-
-SecretBox writes:
-
-```text
-secrets/apiclient_key.pem
-```
-
-and adds:
-
-```env
-WECHAT_PAY_PRIVATE_KEY_PATH=./secrets/apiclient_key.pem
-```
-
-### Service account JSON
-
-The user uploads:
-
-```text
-google-service-account.json
-```
-
-SecretBox writes:
-
-```text
-secrets/google-service-account.json
-```
-
-and adds:
-
-```env
-GOOGLE_APPLICATION_CREDENTIALS=./secrets/google-service-account.json
-```
-
----
-
-## Design principles
-
-1. **Secrets should not enter chat.**
-2. **Agents declare needs; users provide values.**
-3. **The agent receives status, not secrets.**
-4. **Merge beats replace.**
-5. **Conflict beats silent overwrite.**
-6. **Every write should be auditable.**
-7. **Every secret target should be policy-bound.**
-8. **A small safe tool is better than a large magical one.**
-9. **Be honest about the boundary.**
-10. **Security behavior must be the default, not an advanced option.**
-
----
-
-## Repository structure
-
-```text
-OpenAgent-secretbox/
-|-- .github/workflows/ci.yml
-|-- README.md
-|-- SECURITY.md
-|-- pyproject.toml
-|-- uv.lock
-|-- schemas/request-v1.json
-|-- schemas/result-v1.json
-|-- src/openagent_secretbox/
-|   |-- cli.py
-|   |-- mcp_server.py
-|   |-- models.py
-|   |-- policy.py
-|   |-- protocol.py
-|   |-- redaction.py
-|   |-- schema.py
-|   |-- server.py
-|   |-- templates.py
-|   `-- writers.py
-|-- examples/
-|-- integrations/hermes/
-|-- docs/
-`-- tests/
-```
-
----
-
-## Contributing
-
-This project welcomes contributions, especially around:
-
-- secure `.env` merging
-- path allowlist policy
-- local web intake UX
-- CLI design
-- agent integration protocols
-- threat modeling
-- tests for unsafe edge cases
-
-Please read [SECURITY.md](./SECURITY.md) before contributing.
-
-Do not include real credentials in issues, pull requests, logs, screenshots, tests, or examples.
-
----
-
-## License
-
-MIT License. See [LICENSE](./LICENSE).
+License: [MIT](./LICENSE).

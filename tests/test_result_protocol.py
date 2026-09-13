@@ -236,6 +236,15 @@ def test_intake_lifecycle_events_match_protocol(event: dict[str, Any]) -> None:
             "request_id": "anthropic-local-setup",
             "status": "awaiting_input",
             "expires_at": "2026-07-23T12:00:00Z",
+            "browser_opened": False,
+            "portal_url": "https://secretbox.example.com",
+        },
+        {
+            "schema_version": 1,
+            "intake_id": "int_0123456789abcdef",
+            "request_id": "anthropic-local-setup",
+            "status": "awaiting_input",
+            "expires_at": "2026-07-23T12:00:00Z",
         },
         {
             "schema_version": 1,
@@ -284,7 +293,8 @@ def test_intake_lifecycle_events_match_protocol(event: dict[str, Any]) -> None:
         },
     ],
     ids=[
-        "open",
+        "open-local",
+        "open-remote-portal",
         "status-awaiting",
         "status-applied",
         "status-failed",
@@ -414,6 +424,64 @@ def test_agent_protocol_rejects_cli_headless_bearer_bootstrap() -> None:
     assert not RESULT_VALIDATOR.is_valid(event)
     with pytest.raises(ResultValidationError):
         normalize_agent_result(event)
+
+
+@pytest.mark.parametrize(
+    "portal_url",
+    [
+        "http://secretbox.example.com",
+        "https://secretbox.example.com/intake/test",
+        "https://secretbox.example.com?request=test",
+        "https://secretbox.example.com/#token=test",
+        "https://user:pass@secretbox.example.com",
+        r"https://secretbox.example.com\ses_example",
+        "https://:443",
+        "https://secretbox.example.com.",
+        "https://secretbox.example.com:65536",
+        "https://secretbox.example.com:",
+        "HTTPS://secretbox.example.com",
+        "https://secret_box.example.com",
+        "https://[::::]",
+        "https://[abc]",
+        "https://[1:2:3:4:5:6:7:8:9]",
+        "https://[::ffff:192.0.2.128]",
+        "https://" + ".".join(["a" * 63] * 4),
+        "https://exa\tmple.com",
+        "https://exam\nple.com",
+        "https://exam\rple.com",
+        "https://secretbox.example.com\n",
+    ],
+)
+def test_mcp_portal_url_must_be_a_fixed_https_origin(portal_url: str) -> None:
+    result = {
+        "schema_version": 1,
+        "intake_id": "int_0123456789abcdef",
+        "request_id": "anthropic-local-setup",
+        "status": "awaiting_input",
+        "expires_at": "2026-07-23T12:00:00Z",
+        "browser_opened": False,
+        "portal_url": portal_url,
+    }
+
+    assert not RESULT_VALIDATOR.is_valid(result)
+    with pytest.raises(ResultValidationError):
+        normalize_agent_result(result)
+
+
+def test_mcp_portal_url_requires_remote_delivery_state() -> None:
+    result = {
+        "schema_version": 1,
+        "intake_id": "int_0123456789abcdef",
+        "request_id": "anthropic-local-setup",
+        "status": "awaiting_input",
+        "expires_at": "2026-07-23T12:00:00Z",
+        "browser_opened": True,
+        "portal_url": "https://secretbox.example.com",
+    }
+
+    assert not RESULT_VALIDATOR.is_valid(result)
+    with pytest.raises(ResultValidationError):
+        normalize_agent_result(result)
 
 
 class _FakeThread:

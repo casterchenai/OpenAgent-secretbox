@@ -13,6 +13,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-worker:
+    name: Real Linux Worker acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install client and test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Start isolated Linux lab
+        run: docker compose -f deploy/linux-worker/compose.yaml up -d --build
+      - name: Real database and fault acceptance
+        run: python .github/scripts/accept_linux_worker.py
+      - name: End-to-end Worker MCP
+        run: python .github/scripts/smoke_worker_mcp.py
+      - name: Remove disposable lab
+        if: always()
+        run: docker compose -f deploy/linux-worker/compose.yaml down --volumes
+
   tests:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

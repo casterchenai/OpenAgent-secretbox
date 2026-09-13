@@ -1,9 +1,9 @@
-"""MCP stdio adapter for local, browser-mediated secret intake.
+"""MCP stdio adapter for local and authenticated remote secret intake.
 
 The MCP boundary accepts request metadata only.  Secret values travel from the
-browser directly to the loopback intake server and are never returned through
-MCP.  The trusted workspace and host target allowlist are process-startup
-configuration, not tool arguments an agent can expand.
+browser directly to the intake server and are never returned through MCP.  The
+trusted workspace, target allowlist, and optional remote Gateway configuration
+are process-startup controls, not tool arguments an agent can expand.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import copy
+import os
 import re
 import secrets
 import stat
@@ -36,7 +37,15 @@ from .protocol import (
 from .redaction import REDACTED, redact_result
 from .schema import RequestValidationError, validate_request
 from .server import Serving, UnknownSession, serve_once
-from .writers import apply_request
+from .writers import (
+    WriteError,
+    _inspect_destination,
+    _inspect_windows_acl,
+    _same_file_identity,
+    _windows_acl_is_owner_only,
+    _windows_current_sid,
+    apply_request,
+)
 
 SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 600
@@ -58,6 +67,9 @@ _PUBLIC_STATUS = {
 _PUBLIC_ERROR_CODES = frozenset({"apply_blocked", "apply_failed", "expired"})
 _INTAKE_ID_PATTERN = re.compile(r"^int_[A-Za-z0-9_-]{16,64}$")
 _WINDOWS_REPARSE_POINT = 0x0400
+DEFAULT_GATEWAY_BIND = "127.0.0.1"
+DEFAULT_GATEWAY_PORT = 17_321
+MAX_OWNER_KEY_BYTES = 4_096
 
 
 class McpConfigurationError(ValueError):
@@ -70,6 +82,7 @@ class _ManagedIntake:
     request_id: str
     serving: Serving | None
     created_at: float
+    gateway: bool = False
     snapshot: dict[str, Any] | None = None
 
 
@@ -123,7 +136,7 @@ def _release_terminal_serving(serving: Serving) -> None:
 
 
 class IntakeManager:
-    """Own loopback intake servers for one MCP stdio process."""
+    """Own local intake servers or one fixed remote Gateway for an MCP process."""
 
     def __init__(
         self,
@@ -133,6 +146,8 @@ class IntakeManager:
         max_active: int = DEFAULT_MAX_ACTIVE_INTAKES,
         browser_open: Callable[[str], bool] | None = None,
         server_factory: Callable[..., Serving] = serve_once,
+        gateway_broker: Any | None = None,
+        gateway_runtime: Any | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         supplied = Path(workspace).expanduser()
@@ -156,6 +171,8 @@ class IntakeManager:
         self.max_active = max_active
         self._browser_open = browser_open or (lambda url: bool(webbrowser.open(url, new=2)))
         self._server_factory = server_factory
+        self._gateway_broker = gateway_broker
+        self._gateway_runtime = gateway_runtime
         self._clock = clock
         self._lock = threading.RLock()
         self._intakes: dict[str, _ManagedIntake] = {}
@@ -185,12 +202,18 @@ class IntakeManager:
     def _finalize_locked(
         self,
         record: _ManagedIntake,
-        serving: Serving,
+        serving: Serving | None,
         output: dict[str, Any],
     ) -> dict[str, Any]:
         record.snapshot = copy.deepcopy(output)
         record.serving = None
-        _release_terminal_serving(serving)
+        if serving is not None:
+            _release_terminal_serving(serving)
+        elif record.gateway and self._gateway_broker is not None:
+            try:
+                self._gateway_broker.discard_terminal(record.intake_id)
+            except Exception:
+                pass
         self._trim_terminal_locked(protect=record.intake_id)
         return copy.deepcopy(output)
 
@@ -198,19 +221,35 @@ class IntakeManager:
         if record.snapshot is not None:
             return copy.deepcopy(record.snapshot)
         serving = record.serving
-        if serving is None:
-            return _error("status_unavailable", "Intake status is unavailable.")
-        try:
-            handle = serving.handle
-            if handle is None:
-                raise UnknownSession()
-            raw = serving.store.get(handle.session_id)
-        except (AttributeError, UnknownSession):
-            return self._finalize_locked(
-                record,
-                serving,
-                _error("status_unavailable", "Intake status is unavailable."),
-            )
+        if record.gateway:
+            if self._gateway_broker is None:
+                return self._finalize_locked(
+                    record,
+                    None,
+                    _error("status_unavailable", "Intake status is unavailable."),
+                )
+            try:
+                raw = self._gateway_broker.status(record.intake_id)
+            except Exception:
+                return self._finalize_locked(
+                    record,
+                    None,
+                    _error("status_unavailable", "Intake status is unavailable."),
+                )
+        else:
+            if serving is None:
+                return _error("status_unavailable", "Intake status is unavailable.")
+            try:
+                handle = serving.handle
+                if handle is None:
+                    raise UnknownSession()
+                raw = serving.store.get(handle.session_id)
+            except (AttributeError, UnknownSession):
+                return self._finalize_locked(
+                    record,
+                    serving,
+                    _error("status_unavailable", "Intake status is unavailable."),
+                )
 
         raw_status = raw.get("status")
         if not isinstance(raw_status, str) or raw_status not in _PUBLIC_STATUS:
@@ -330,6 +369,52 @@ class IntakeManager:
                     "Complete or cancel an existing intake before opening another one.",
                 )
             self._trim_terminal_locked()
+            if self._gateway_broker is not None:
+                try:
+                    created = self._gateway_broker.create(
+                        server_request,
+                        apply_values,
+                        ttl=ttl_seconds,
+                    )
+                    intake_id = str(created["intake_id"])
+                    expires_at = float(created["expires_at"])
+                    portal_url = str(created["portal_url"])
+                except Exception:
+                    return _error(
+                        "server_unavailable",
+                        "The remote intake gateway could not create the request.",
+                    )
+                record = _ManagedIntake(
+                    intake_id=intake_id,
+                    request_id=model.request_id,
+                    serving=None,
+                    created_at=self._clock(),
+                    gateway=True,
+                )
+                self._intakes[intake_id] = record
+                try:
+                    return normalize_mcp_result(
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "intake_id": intake_id,
+                            "request_id": model.request_id,
+                            "status": "awaiting_input",
+                            "expires_at": _iso_timestamp(expires_at),
+                            "browser_opened": False,
+                            "portal_url": portal_url,
+                        }
+                    )
+                except (ResultValidationError, TypeError, ValueError):
+                    self._intakes.pop(intake_id, None)
+                    try:
+                        self._gateway_broker.cancel(intake_id)
+                        self._gateway_broker.discard_terminal(intake_id)
+                    except Exception:
+                        pass
+                    return _error(
+                        "server_unavailable",
+                        "The remote intake gateway returned invalid discovery metadata.",
+                    )
             try:
                 serving = self._server_factory(
                     request=server_request,
@@ -399,6 +484,20 @@ class IntakeManager:
             if record.snapshot is not None:
                 return copy.deepcopy(record.snapshot)
             serving = record.serving
+            if record.gateway:
+                if self._gateway_broker is None:
+                    return _error("status_unavailable", "Intake status is unavailable.")
+                try:
+                    raw = self._gateway_broker.cancel(record.intake_id)
+                except Exception:
+                    return self._status_locked(record)
+                if raw.get("status") == "submitted":
+                    return _error(
+                        "apply_in_progress",
+                        "Secret application is in progress and can no longer be cancelled. "
+                        "Poll status for the final result.",
+                    )
+                return self._status_locked(record)
             if serving is None:
                 return _error("status_unavailable", "Intake status is unavailable.")
             try:
@@ -445,6 +544,12 @@ class IntakeManager:
         for record in records:
             if record.serving is not None:
                 record.serving.close()
+        try:
+            if self._gateway_runtime is not None:
+                self._gateway_runtime.close()
+        finally:
+            if self._gateway_broker is not None:
+                self._gateway_broker.close()
 
 
 def create_mcp_server(manager: IntakeManager) -> Any:
@@ -470,8 +575,8 @@ def create_mcp_server(manager: IntakeManager) -> Any:
     app = FastMCP(
         "OpenAgent SecretBox",
         instructions=(
-            "Open one-time local secret intake pages. Never include secret values in tool "
-            "arguments. The server returns status metadata only and never returns bearer URLs."
+            "Open one-time secret intake pages. Never include secret values in tool arguments. "
+            "The server returns status metadata only and never returns bearer URLs."
         ),
         lifespan=lifespan,
     )
@@ -488,7 +593,7 @@ def create_mcp_server(manager: IntakeManager) -> Any:
     def open_secret_intake(
         request: dict[str, Any], ttl_seconds: int = DEFAULT_TTL_SECONDS
     ) -> dict[str, Any]:
-        """Open the local one-time form for request metadata.
+        """Open the configured one-time form for request metadata.
 
         Never place API keys, passwords, tokens, private-key content, bearer
         URLs, or other secret values in ``request``.  The workspace is fixed by
@@ -521,7 +626,7 @@ def create_mcp_server(manager: IntakeManager) -> Any:
         )
     )
     def cancel_secret_intake(intake_id: str) -> dict[str, Any]:
-        """Stop a pending intake and invalidate its local page."""
+        """Stop a pending intake and invalidate its page."""
 
         return manager.cancel_intake(intake_id)
 
@@ -536,6 +641,123 @@ def _positive_max_active(value: str) -> int:
     if not 1 <= parsed <= MAX_CONFIGURED_ACTIVE_INTAKES:
         raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_CONFIGURED_ACTIVE_INTAKES}")
     return parsed
+
+
+def _gateway_port(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= parsed <= 65_535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return parsed
+
+
+def _read_gateway_owner_key(value: str) -> str:
+    """Read a small owner-only key file without following or racing a link."""
+
+    path = Path(value).expanduser()
+    fd: int | None = None
+    try:
+        inspected = _inspect_destination(path)
+        if inspected is None:
+            raise WriteError("owner key file does not exist")
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) > 1
+            or not _same_file_identity(inspected, opened)
+        ):
+            raise WriteError("owner key file changed during validation")
+        _require_owner_key_permissions(path, opened)
+
+        chunks: list[bytes] = []
+        remaining = MAX_OWNER_KEY_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_OWNER_KEY_BYTES:
+            raise WriteError("owner key file is too large")
+
+        verified = os.fstat(fd)
+        current = _inspect_destination(path)
+        if (
+            current is None
+            or not _same_file_identity(opened, verified)
+            or not _same_file_identity(verified, current)
+        ):
+            raise WriteError("owner key file changed while reading")
+        _require_owner_key_permissions(path, verified)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise McpConfigurationError(
+            "gateway owner key file must be a secure owner-only regular file"
+        ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+    if not raw or b"\r" in raw or b"\n" in raw or b"\x00" in raw:
+        raise McpConfigurationError("gateway owner key file must contain exactly one key")
+    try:
+        key = raw.decode("ascii", "strict")
+    except UnicodeDecodeError as exc:
+        raise McpConfigurationError("gateway owner key must be ASCII") from exc
+    if len(key) < 32 or key != key.strip():
+        raise McpConfigurationError("gateway owner key is invalid")
+    return key
+
+
+def _require_owner_key_permissions(path: Path, expected: os.stat_result) -> None:
+    """Reject an existing key unless it was already private before reading."""
+
+    current = _inspect_destination(path)
+    if current is None or not _same_file_identity(expected, current):
+        raise WriteError("owner key file changed during permission validation")
+    if os.name == "nt":
+        snapshot = _inspect_windows_acl(path)
+        if not _windows_acl_is_owner_only(snapshot, _windows_current_sid()):
+            raise WriteError("owner key file permissions are not owner-only")
+        return
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and expected.st_uid != getuid():
+        raise WriteError("owner key file is owned by another user")
+    if stat.S_IMODE(expected.st_mode) != 0o600:
+        raise WriteError("owner key file permissions are not owner-only")
+
+
+def _gateway_arguments(args: argparse.Namespace) -> tuple[str, str, int, str] | None:
+    names = (
+        "gateway_public_origin",
+        "gateway_bind",
+        "gateway_port",
+        "gateway_owner_key_file",
+    )
+    values = tuple(getattr(args, name) for name in names)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise McpConfigurationError(
+            "all four gateway options must be provided together"
+        )
+    public_origin, bind, port, owner_key_file = values
+    if bind != DEFAULT_GATEWAY_BIND:
+        raise McpConfigurationError("gateway bind must be 127.0.0.1")
+    return str(public_origin), str(bind), int(port), str(owner_key_file)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -561,6 +783,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_ACTIVE_INTAKES,
         help=f"maximum simultaneous intake pages (default: {DEFAULT_MAX_ACTIVE_INTAKES})",
     )
+    gateway = parser.add_argument_group("fixed remote gateway")
+    gateway.add_argument(
+        "--gateway-public-origin",
+        help="fixed HTTPS origin exposed by a trusted reverse proxy",
+    )
+    gateway.add_argument(
+        "--gateway-bind",
+        help="internal listener address; remote mode requires 127.0.0.1",
+    )
+    gateway.add_argument(
+        "--gateway-port",
+        type=_gateway_port,
+        help="fixed internal listener port",
+    )
+    gateway.add_argument(
+        "--gateway-owner-key-file",
+        help="owner-only access-key file configured outside Agent chat",
+    )
     return parser
 
 
@@ -568,16 +808,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the MCP server over stdio; stdout is reserved for protocol frames."""
 
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
+    manager: IntakeManager | None = None
+    runtime: Any | None = None
     try:
+        gateway_broker: Any | None = None
+        gateway_options = _gateway_arguments(args)
+        if gateway_options is not None:
+            from .gateway import GatewayBroker, GatewayRuntime
+
+            public_origin, bind, port, owner_key_file = gateway_options
+            owner_key = _read_gateway_owner_key(owner_key_file)
+            try:
+                try:
+                    gateway_broker = GatewayBroker(public_origin, owner_key)
+                finally:
+                    del owner_key
+            except ValueError as exc:
+                raise McpConfigurationError(str(exc)) from exc
+            if not gateway_broker.secure_cookies:
+                raise McpConfigurationError("gateway public origin must use HTTPS")
+            try:
+                runtime = GatewayRuntime(gateway_broker, host=bind, port=port)
+            except (OSError, ValueError) as exc:
+                raise McpConfigurationError("gateway listener could not be started") from exc
+
         manager = IntakeManager(
             args.workspace,
             allowed_targets=DEFAULT_ALLOWED_TARGETS + tuple(args.allow_target),
             max_active=args.max_active,
+            gateway_broker=gateway_broker,
+            gateway_runtime=runtime,
         )
+        if runtime is not None:
+            try:
+                runtime.start()
+            except RuntimeError as exc:
+                raise McpConfigurationError("gateway listener could not be started") from exc
         app = create_mcp_server(manager)
     except McpConfigurationError as exc:
+        if manager is not None:
+            manager.close()
+        elif runtime is not None:
+            runtime.close()
         print(f"secretbox-mcp: {exc}", file=sys.stderr)
         return 2
+    assert manager is not None
     atexit.register(manager.close)
     try:
         app.run(transport="stdio")

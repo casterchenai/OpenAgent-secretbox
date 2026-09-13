@@ -1,249 +1,189 @@
 ---
 name: openagent-secretbox
-description: "Open local secret intake without exposing secret values."
-version: 1.1.0
-author: casterchenai
-license: MIT
-platforms: [linux, macos, windows]
-metadata:
-  hermes:
-    tags: [security, secrets, credentials, local-first, mcp]
-    category: security
+description: Securely collect API keys, passwords, certificates, private keys, environment variables, and other sensitive files for an approved project without placing their values or contents in Hermes chat. Use when Hermes needs user-provided secrets written to a preconfigured local workspace through a loopback browser or to a preconfigured remote server through a fixed HTTPS SecretBox portal.
 ---
 
-# OpenAgent SecretBox Skill
+# OpenAgent SecretBox
 
-Open a policy-bound local browser intake while keeping bearer URLs, secret
-values, and target-file contents outside Hermes. Prefer the preconfigured
-SecretBox MCP tools; use the user-launched CLI flow only as a fallback.
+Use only the SecretBox MCP server already configured by the trusted user. Keep
+secret values, uploaded file contents, browser credentials, and destination
+file contents outside Hermes.
 
-## When to Use
+## Required tools
 
-- Use when a local project needs API keys, tokens, passwords, certificates,
-  private keys, or other credentials written to `.env`, `.env.*`, or
-  `secrets/*`.
-- Use when the user wants a browser intake instead of pasting a value into chat.
-- Do not use this skill to read, rotate, transform, test, or display an existing
-  secret.
-- Do not use it for remote intake. The supported flow is loopback-only on the
-  trusted user's machine.
-
-## Prerequisites
-
-Prefer these exact tools from the user-configured `openagent-secretbox` MCP
-server:
+Use exactly these tools from the configured `openagent-secretbox` server:
 
 - `mcp__openagent_secretbox__open_secret_intake`
 - `mcp__openagent_secretbox__get_secret_intake_status`
 - `mcp__openagent_secretbox__cancel_secret_intake`
 
-The trusted user, not the agent, must register that server with a fixed
-workspace and host allowlist. If the tools are absent, do not run `hermes mcp
-add` or edit Hermes config. Use the manual fallback below and point the user to
-the integration install instructions.
+If any tool is unavailable, stop and ask the user to complete the trusted
+SecretBox setup. Do not install the package, register MCP, generate an owner
+key, configure a workspace, extend an allowlist, set a public origin, start a
+gateway, or edit Hermes configuration.
 
 Read [the trusted user boundary](references/trusted-user-boundary.md) before
-using an unfamiliar service or a target beyond the default allowlist.
-
-## How to Run
-
-Invoke this skill with credential names and the intended task, never credential
-values:
-
-```text
-/openagent-secretbox prepare OPENAI_API_KEY for this project
-```
-
-Use [the request template](templates/request-v1.json) as a structural starting
-point. Replace or remove every example need before opening intake.
-
-## Quick Reference
-
-| Actor | Allowed | Forbidden |
-|---|---|---|
-| Hermes | Define metadata; call MCP open/status/cancel; report redacted status | Receive values; pass workspace/host allowlist; receive or open intake URLs; inspect targets |
-| Trusted user | Register fixed MCP policy; review targets; use local browser | Paste URL tokens or values into chat |
-| SecretBox MCP | Apply startup policy; open browser server-side; return ids/status only | Return URL, token, session id, or submitted values |
-
-Hard stops:
-
-- Never ask for or accept a secret value through chat or a tool argument.
-- Never call `secretbox serve`, `secretbox-mcp`, or `hermes mcp add` through
-  `terminal`, a subagent, a script, a scheduled job, or another agent tool.
-- Never navigate to, poll, inspect, or screenshot an `/intake/` URL with Hermes.
-- Never pass `workspace_root` or `allowed_targets` in the MCP request object.
+handling an unfamiliar deployment, a policy rejection, or a suspected
+exposure. Use [the request template](templates/request-v1.json) only as a
+metadata structure; replace every example need.
 
 ## Procedure
 
-### 1. Select the path
+### 1. Define metadata
 
-Use MCP when all three exact tools listed under Prerequisites are available.
-Otherwise use Manual Fallback. Do not silently substitute a similarly named MCP
-server because its startup workspace and policy may differ.
-
-Completion criterion: the chosen path is either the exact trusted MCP server or
-the explicit user-launched fallback.
-
-### 2. Define metadata only
-
-Identify:
+Describe only:
 
 - a short request id and title;
-- each input's non-secret name, type, description, and relative target;
-- whether each input is required.
+- each input's public name, type, description, and required flag;
+- an exact relative `target` for each `file` or `env_file` input;
+- a conservative TTL, write policy, size limits, and forbidden targets.
 
-Ask only for missing metadata. Never ask the user to paste, upload, describe,
-partially reveal, hash, encode, or confirm a secret value in chat.
+Use `env` for one environment variable, `file` for an uploaded file, and
+`env_file` only when the user explicitly wants to paste an environment block
+inside SecretBox. Do not put `target` on an `env` need; its effective target is
+`write_policy.env_file`. Use `default_value` only for clearly non-secret path
+text.
 
-Use `env` for one environment variable, `file` for a private file, and
-`env_file` only when the user explicitly wants to paste an environment block in
-the SecretBox browser. Use `default_value` only for a clearly non-secret path
-such as `./secrets/client.pem`; omit it when uncertain.
+Never ask the user to paste, upload, encode, hash, summarize, or partially
+reveal a secret in chat. Never include values, absolute paths,
+`workspace_root`, `allowed_targets`, bearer data, or URL fields in the request.
+Never target `.git`, source files, executables, shell startup files, or Hermes
+configuration.
 
-The request object must omit `workspace_root` and `allowed_targets`. They are
-trusted MCP startup controls, not agent inputs. Keep these policy values:
+Keep this write policy unless the trusted service enforces a narrower one:
 
 ```json
 {
-  "schema_version": 1,
-  "write_policy": {
-    "env_file": ".env.local",
-    "mode": "merge_only",
-    "no_overwrite": true,
-    "backup": false
-  }
+  "env_file": ".env.local",
+  "mode": "merge_only",
+  "no_overwrite": true,
+  "backup": false,
+  "max_file_size": 1048576
 }
 ```
 
-Never propose `.git`, source files, executables, shell startup files, Hermes
-configuration, or absolute/traversing paths as targets.
+Use per-file `max_bytes` and top-level `forbidden_targets` only to narrow the
+trusted service policy. Never imply that request metadata can expand the
+server's allowlist or size limits.
 
-If a value or intake URL has already entered chat or tool output, do not quote
-it. Follow Exposure Response in the trusted-boundary reference.
+### 2. Preview and open
 
-Completion criterion: every need is expressible without a value, workspace, or
-host-policy argument.
+Show the title, public input names, effective destination for every input,
+required flags, TTL, write policy, size limits, and forbidden targets. For an
+`env` need, label `write_policy.env_file` as its effective destination. Obtain
+confirmation unless the user already approved those exact fields in the
+current turn.
 
-### 3. Preview the request
-
-Show only the title, variable/input names, relative targets, required flags,
-TTL, and enforced write policy. Obtain confirmation unless the user already
-approved those exact fields in the current turn. Do not display placeholders
-that could be mistaken for real credentials.
-
-Completion criterion: the user can see every proposed write target before the
-browser accepts values.
-
-### 4. Open with MCP
-
-Call `mcp__openagent_secretbox__open_secret_intake` with exactly:
+Call `mcp__openagent_secretbox__open_secret_intake` with only `request` and
+`ttl_seconds`. A valid request follows this shape:
 
 ```json
 {
   "request": {
     "schema_version": 1,
-    "request_id": "service-local-setup",
-    "title": "Service local credential setup",
+    "request_id": "service-setup",
+    "title": "Service credential setup",
     "needs": [],
+    "forbidden_targets": [".git", "node_modules"],
     "write_policy": {
       "env_file": ".env.local",
       "mode": "merge_only",
       "no_overwrite": true,
-      "backup": false
+      "backup": false,
+      "max_file_size": 1048576
     }
   },
   "ttl_seconds": 600
 }
 ```
 
-Populate `needs`; do not add `workspace_root`, `allowed_targets`, values, or URL
-fields. The expected result contains `schema_version`, `intake_id`,
-`request_id`, `status`, `expires_at`, and `browser_opened` only. `intake_id` is
-a non-secret status handle and may remain in context.
+Populate `needs`. Treat `intake_id` as a non-secret status handle.
 
-Tell the user that SecretBox opened the local browser and that the page is
-single-use. Do not ask them to send anything from the page back to chat.
+### 3. Guide the user by the returned mode
 
-If MCP returns `invalid_request` or `policy_rejected`, fix metadata or ask the
-user to review trusted policy. Never weaken write policy or configure a broader
-workspace/allowlist yourself. If it returns `browser_open_failed` or
-`server_unavailable`, cancel any known intake and use Manual Fallback.
+- When `browser_opened` is `true`, tell the user that SecretBox opened a
+  single-use page in their local browser. Do not send or request a URL.
+- When `browser_opened` is `false` and `portal_url` is present, tell the user to
+  open that fixed portal. Relay it only when it is an HTTPS origin root with no
+  user info, non-root path, query, or fragment. Do not append `intake_id`, a
+  request id, or any other data to it.
 
-Completion criterion: the result is `awaiting_input`, contains no URL/token,
-and the user's local browser is open.
+The fixed `portal_url` may appear in remote chat because it is a public service
+entry point, not an intake credential. Never navigate to, inspect, screenshot,
+or authenticate to the portal with an agent browser. Never expose an owner key
+or ask the user to return information from the page.
 
-### 5. Check or cancel safely
+Reject any open result that contains an intake path, session id, token, query,
+fragment, or non-HTTPS remote URL. Report a service configuration error without
+repeating the suspicious value.
+
+### 4. Poll or cancel
 
 After the user submits, or when they ask for progress, call
 `mcp__openagent_secretbox__get_secret_intake_status` with only `intake_id`.
-Accept only redacted statuses: `awaiting_input`, `applied`, `failed`,
-`cancelled`, or `expired`.
+Accept lifecycle statuses only when they are `awaiting_input`, `applied`,
+`failed`, `cancelled`, or `expired`. A response with `status: error` is a tool
+error, not an intake lifecycle state.
+
+If the user reports that the page was refreshed, closed, or says it can no
+longer be opened, poll the same `intake_id`. The fixed portal home page is
+reusable, but a selected intake form can be opened only once. Refresh never
+authorizes creating a replacement automatically.
 
 Call `mcp__openagent_secretbox__cancel_secret_intake` with only `intake_id` when
-the user cancels, a preview was wrong, or a replacement intake is required.
-Never cancel an unrelated id.
+the user cancels or a replacement is required after an intake was opened.
+Never cancel an unrelated intake.
 
-If cancel returns `apply_in_progress`, secret application has already started.
-Do not retry cancellation and do not open a replacement intake. Poll that same
-`intake_id` until it reaches `applied` or `failed`, then report the real result.
+If cancellation returns `apply_in_progress`, keep polling the same intake until
+it reaches `applied` or `failed`. Do not open a replacement while application
+is in progress. Open a replacement only after cancellation authoritatively
+returns `cancelled`, or after another terminal state is known and the user
+confirms a new request. If cancellation returns `awaiting_input`, an error, or
+an uncertain result, retain the same `intake_id` and do not create a second
+active intake.
 
-On success, report only declared names, relative target paths, write actions,
-and redacted status. Never verify by reading `.env`, file contents, process
+Handle every public tool error without inventing status:
+
+- Correct `invalid_ttl` or `invalid_request` metadata and preview it again.
+- For `policy_rejected`, ask the trusted operator to review configuration
+  outside Hermes; never weaken policy.
+- For `too_many_active_intakes`, let the user finish or explicitly cancel a
+  known intake before retrying.
+- For `server_closed`, `server_unavailable`, `browser_open_failed`, or
+  `status_unavailable`, report that SecretBox is unavailable and retry only the
+  same safe operation when the user asks.
+- For `intake_not_found`, report that the handle is no longer retained and ask
+  before preparing a new request.
+- For `apply_in_progress`, poll the same intake to a terminal state.
+
+### 5. Report only public results
+
+Report the terminal status and top-level `error_code` when present, plus
+declared names, relative targets, write actions, conflict entries, missing
+names, and stable codes from `blocked` entries. Do not invent a code for a
+conflict entry. Do not verify success by reading destination files, process
 environments, logs, hashes, or encoded derivatives.
 
-Completion criterion: a terminal redacted status is reported and no submitted
-value entered Hermes.
+If the service returns `policy_rejected`, ask the user to review the trusted
+workspace and allowlist outside Hermes. Never weaken the policy or reconfigure
+the service yourself.
 
-## Manual Fallback
+## Hard stops
 
-Use this only when the trusted MCP tools are absent or unavailable.
+- Never receive a secret value or sensitive file through chat or a tool
+  argument.
+- Never run SecretBox bootstrap, server, key-generation, MCP-registration, or
+  reverse-proxy commands through Hermes, a subagent, or a scheduled task.
+- Never pass `workspace_root` or `allowed_targets` to an intake tool.
+- Never open or inspect a SecretBox page or a destination file.
+- Never treat output redaction as OS-level isolation.
 
-1. Write the metadata-only request JSON under
-   `<workspace>/.secretbox/requests/<request-id>.json` or another untracked
-   path. Omit `workspace_root`, `allowed_targets`, and all values.
-2. Run only `secretbox validate "<absolute-request-path>"`. Do not start intake.
-3. Print one reviewed command:
+## Completion check
 
-```bash
-secretbox serve --workspace "<absolute-workspace-path>" --request "<absolute-request-path>"
-```
-
-Precede it with: "Run this yourself in a separate trusted local terminal, not
-through Hermes." Do not execute it or add `--no-open`, `--json`,
-`--allow-target`, `--host`, or a fixed port.
-
-If browser auto-open fails, the user may privately add `--no-open` in their
-trusted terminal. They must not paste the printed URL into chat, logs, issues,
-or a remote messaging gateway. Wait for status-only user confirmation; the MCP
-status tools do not own or track this fallback intake.
-
-Completion criterion: the user runs the fallback, no intake URL appears in
-agent-visible output, and the user reports only a redacted outcome.
-
-## Pitfalls
-
-- Running `hermes mcp add` from an agent tool lets the agent choose the trusted
-  workspace. Registration belongs to a separate user-controlled terminal.
-- `--args` is a remainder argument in Hermes CLI and must be the final Hermes
-  option; all following values configure `secretbox-mcp`.
-- MCP request `workspace_root` and `allowed_targets` are unnecessary authority
-  assertions. Omit them even though request schema v1 accepts them.
-- Manual `secretbox serve --no-open --json` emits the bearer URL. It is
-  forbidden in agent-visible execution.
-- Hermes skill `metadata.hermes.config` values are injected into skill context.
-  Never declare credentials there or add `setup.collect_secrets` entries.
-- Existing conflicting values are blocked by design. Do not read the old value
-  or weaken no-overwrite; tell the user to resolve ownership outside Hermes.
-- Output redaction and stdio environment filtering are not containment. An
-  unrestricted local Hermes process can still read files available to its OS
-  identity.
-
-## Verification
-
-- [ ] The trusted user configured MCP workspace/allowlist outside Hermes.
-- [ ] The request contains metadata only and omits workspace/allowed targets.
-- [ ] No secret, encoded secret, bearer token, or intake URL entered Hermes.
-- [ ] MCP open returned only an intake id, redacted status, and expiry metadata.
-- [ ] Hermes never opened or inspected the intake page or destination files.
-- [ ] Final reporting contains only redacted status, names, and relative paths.
-- [ ] Strict-separation deployments use an OS or whole-process boundary.
+- Confirm that only the three expected tools were used.
+- Confirm that the request contained metadata and relative targets only.
+- Confirm that local mode exposed no URL, or remote mode exposed only the fixed
+  HTTPS portal root.
+- Confirm that no secret, file content, owner key, bearer token, or intake URL
+  entered Hermes.
+- Confirm that the final report contains only redacted public metadata.

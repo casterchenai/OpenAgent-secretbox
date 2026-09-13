@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -406,3 +407,150 @@ def test_serve_honours_request_allowlist_as_a_narrowing_constraint(
     )
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["code"] == "policy_rejected"
+
+
+def test_gateway_keygen_creates_high_entropy_owner_only_key_without_printing_it(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "owner.key"
+
+    assert cli.main(["gateway", "keygen", "--output", str(output)]) == 0
+
+    key = output.read_text(encoding="ascii").strip()
+    assert len(base64.urlsafe_b64decode(key)) == cli.OWNER_KEY_BYTES
+    assert len(key) == 64
+    captured = capsys.readouterr()
+    assert captured.out.strip() == (
+        "gateway owner key created with "
+        f"{'owner-only' if os.name == 'nt' else '0600'} permissions"
+    )
+    assert captured.err == ""
+    assert key not in captured.out
+    assert str(output) not in captured.out
+    if os.name != "nt":
+        assert output.stat().st_mode & 0o777 == 0o600
+
+
+def test_gateway_keygen_json_result_is_metadata_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "owner.key"
+    raw_secret = b"S" * cli.OWNER_KEY_BYTES
+    encoded_secret = base64.urlsafe_b64encode(raw_secret).rstrip(b"=").decode("ascii")
+    monkeypatch.setattr(cli.secrets, "token_bytes", lambda size: raw_secret if size == 48 else b"")
+
+    assert cli.main(["gateway", "keygen", "--output", str(output), "--json"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload == {
+        "artifact": "gateway_owner_key",
+        "mode": "owner-only" if os.name == "nt" else "0600",
+        "schema_version": 1,
+        "status": "created",
+    }
+    assert encoded_secret not in captured.out
+    assert str(output) not in captured.out
+    assert captured.err == ""
+    assert output.read_text(encoding="ascii") == encoded_secret + "\n"
+
+
+def test_gateway_keygen_refuses_overwrite_without_changing_existing_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "owner.key"
+    output.write_text("existing-owner-key\n", encoding="ascii")
+
+    assert (
+        cli.main(["--json", "gateway", "keygen", "--output", str(output)])
+        == cli.EXIT_USAGE
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["error"]["code"] == "owner_key_exists"
+    assert "existing-owner-key" not in captured.out
+    assert output.read_text(encoding="ascii") == "existing-owner-key\n"
+
+
+def test_gateway_keygen_rejects_symlink_target(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    victim = tmp_path / "victim.key"
+    victim.write_text("do-not-change\n", encoding="ascii")
+    output = tmp_path / "owner.key"
+    try:
+        output.symlink_to(victim)
+    except OSError:
+        pytest.skip("symlinks are unavailable for this test user")
+
+    assert (
+        cli.main(["--json", "gateway", "keygen", "--output", str(output)])
+        == cli.EXIT_USAGE
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "owner_key_target_unsafe"
+    assert victim.read_text(encoding="ascii") == "do-not-change\n"
+
+
+def test_gateway_keygen_rejects_symlink_parent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable for this test user")
+    output = linked_parent / "owner.key"
+
+    assert (
+        cli.main(["--json", "gateway", "keygen", "--output", str(output)])
+        == cli.EXIT_USAGE
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "owner_key_target_unsafe"
+    assert not (real_parent / "owner.key").exists()
+
+
+def test_gateway_keygen_cleans_partial_file_when_final_permission_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output = tmp_path / "owner.key"
+    raw_secret = b"X" * cli.OWNER_KEY_BYTES
+    encoded_secret = base64.urlsafe_b64encode(raw_secret).rstrip(b"=").decode("ascii")
+    calls = 0
+    real_set_owner_only = cli._set_owner_only
+
+    def fail_second_check(descriptor: int, path: Path | None = None) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise cli.WriteError(f"must not expose {encoded_secret}")
+        real_set_owner_only(descriptor, path)
+
+    monkeypatch.setattr(cli.secrets, "token_bytes", lambda _size: raw_secret)
+    monkeypatch.setattr(cli, "_set_owner_only", fail_second_check)
+
+    assert (
+        cli.main(["--json", "gateway", "keygen", "--output", str(output)])
+        == cli.EXIT_USAGE
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["error"]["code"] == "owner_key_write_failed"
+    assert encoded_secret not in captured.out
+    assert encoded_secret not in captured.err
+    assert not output.exists()

@@ -413,6 +413,7 @@ def test_windows_acl_repair_uses_icacls_and_verifies_result(
         [
             (sid, False, ((other_sid, True, False),)),
             (sid, True, ((sid, True, True),)),
+            (sid, True, ((sid, True, True),)),
         ]
     )
     commands: list[tuple[Path, tuple[str, ...]]] = []
@@ -434,8 +435,39 @@ def test_windows_acl_repair_uses_icacls_and_verifies_result(
         (target, ("/grant:r", f"*{sid}:(F)")),
         (target, ("/setowner", f"*{sid}")),
         (target, ("/inheritance:r",)),
-        (target, ("/remove", f"*{other_sid}")),
     ]
+
+
+def test_windows_acl_repair_removes_only_rules_remaining_after_inheritance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "private.pem"
+    sid = "S-1-5-21-test"
+    inherited_sid = "S-1-5-21-inherited"
+    explicit_sid = "S-1-5-21-explicit"
+    snapshots = iter(
+        [
+            (sid, False, ((inherited_sid, True, False), (explicit_sid, True, False))),
+            (sid, True, ((sid, True, True), (explicit_sid, True, False))),
+            (sid, True, ((sid, True, True),)),
+        ]
+    )
+    commands: list[tuple[Path, tuple[str, ...]]] = []
+
+    monkeypatch.setattr(writers, "_windows_current_sid", lambda: sid)
+    monkeypatch.setattr(
+        writers, "_inspect_windows_acl", lambda _path: next(snapshots)
+    )
+    monkeypatch.setattr(
+        writers,
+        "_run_icacls",
+        lambda path, *arguments: commands.append((path, arguments)),
+    )
+
+    assert writers._set_windows_owner_only(target) is True
+    assert (target, ("/remove", f"*{explicit_sid}")) in commands
+    assert (target, ("/remove", f"*{inherited_sid}")) not in commands
 
 
 @pytest.mark.parametrize(

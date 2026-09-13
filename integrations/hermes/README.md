@@ -1,105 +1,176 @@
 # Hermes Agent integration
 
-This directory provides a native Hermes Agent skill for OpenAgent SecretBox.
-The preferred path uses SecretBox's local stdio MCP server: the trusted user
-fixes the workspace and host target policy once, then Hermes can open, check,
-and cancel browser-mediated intake without receiving a bearer URL or value.
+OpenAgent SecretBox gives Hermes a user-facing form for sensitive text and
+files. Hermes describes what is needed and where it belongs; the user enters or
+uploads it outside chat; Hermes receives only a redacted completion result.
 
-## 1. Install SecretBox with MCP support
+The Skill install is one command. A trusted user must first configure the
+workspace, target allowlist, and, for remote use, the public gateway. Those
+settings are the authorization boundary and are deliberately not delegated to
+the Agent.
 
-Install the package in an environment visible to Hermes:
+## Choose the deployment
+
+### Local desktop Agent
+
+Use loopback mode for a local Hermes, Codex App, or similar desktop Agent. The
+Agent can name a deeply nested destination without making the user find it. On
+each request SecretBox opens the form directly in the user's local browser. No
+URL or credential enters chat.
+
+### Remote Hermes server
+
+Use fixed-gateway mode when Hermes runs on a cloud server and the user talks to
+it through Hermes Web UI, Feishu, WeChat, or another remote channel. Configure
+one HTTPS origin such as `https://secretbox.example.com` behind the server's
+existing port 443. Every request reuses that origin and a fixed internal port;
+there is no new cloud firewall or security-group change per request.
+
+Remote chat may show the fixed portal URL. It never shows a one-time path,
+session id, query, fragment, or bearer token. The user opens the portal and
+submits values or files directly to SecretBox on the server.
+
+## Install the package
+
+There is no supported PyPI release yet. In a trusted operator terminal, review
+and pin a full Git commit, then install that checkout into the Python
+environment used by Hermes:
 
 ```bash
-python -m pip install "openagent-secretbox[mcp]"
+git clone https://github.com/casterchenai/OpenAgent-secretbox.git
+cd OpenAgent-secretbox
+git checkout <reviewed-full-commit-sha>
+python -m pip install ".[mcp]"
 secretbox-mcp --help
 ```
 
-For a development checkout, install the checkout rather than a registry build:
+Use editable installation only while developing this checkout:
 
 ```bash
 python -m pip install -e ".[mcp]"
 ```
 
-## 2. Register the trusted MCP boundary
+## Trusted bootstrap: local mode
 
-Run this yourself in a trusted local terminal, outside an active Hermes chat:
+Run this once in a trusted terminal outside Hermes chat:
 
 ```bash
 hermes mcp add openagent-secretbox --command secretbox-mcp --args --workspace "/absolute/path/to/project"
 ```
 
-`--args` must be the final Hermes option. Everything after it is passed to
-`secretbox-mcp`. On Windows, an absolute executable and workspace are valid:
+On Windows, absolute executable and workspace paths are supported:
 
 ```powershell
 hermes mcp add openagent-secretbox --command "C:\path\to\secretbox-mcp.exe" --args --workspace "E:\path\to\project"
 ```
 
-The server always authorizes `.env`, `.env.*`, and `secrets/*`. A trusted user
-may explicitly extend that startup policy with a repeated argument:
+The server authorizes `.env`, `.env.*`, and `secrets/*` by default. Add only a
+narrow, reviewed target when the application requires it:
 
 ```bash
 hermes mcp add openagent-secretbox --command secretbox-mcp --args --workspace "/absolute/project" --allow-target "config/private.json"
 ```
 
-Do not ask Hermes to run or modify these commands. The user-selected
-`--workspace` and any `--allow-target` values are the authorization boundary.
+`--args` must be the final Hermes option. Everything after it is passed to
+`secretbox-mcp`.
 
-The add flow probes the stdio server and should discover exactly:
+## Trusted bootstrap: remote fixed gateway
+
+Run every command in this section as the trusted server operator, never through
+Hermes or another Agent.
+
+Generate a gateway owner key outside the project workspace and restrict its
+filesystem permissions:
+
+```bash
+secretbox gateway keygen --output /etc/openagent-secretbox/owner.key
+```
+
+Gateway startup accepts only a key file that is already owner-only. It refuses
+an insecure existing file without repairing and trusting it in place.
+
+Register the MCP process with a fixed public origin, loopback bind, internal
+port, workspace, allowlist, and owner key:
+
+```bash
+hermes mcp add openagent-secretbox \
+  --command secretbox-mcp \
+  --args \
+  --workspace "/srv/apps/payment-service" \
+  --gateway-public-origin "https://secretbox.example.com" \
+  --gateway-bind "127.0.0.1" \
+  --gateway-port "17321" \
+  --gateway-owner-key-file "/etc/openagent-secretbox/owner.key"
+```
+
+Terminate TLS on the existing reverse proxy and forward only this hostname to
+`127.0.0.1:17321`. For example, a minimal Caddy site is:
+
+```caddyfile
+secretbox.example.com {
+    reverse_proxy 127.0.0.1:17321
+}
+```
+
+Keep the gateway bind address on loopback. Open port 443 once at the cloud
+firewall or security group; do not expose the internal gateway port publicly.
+Use a dedicated hostname, valid TLS certificate, and a reverse proxy configured
+not to log request bodies, cookies, or authorization headers.
+
+The owner key, `--workspace`, `--allow-target`, public origin, bind address,
+port, TLS, and reverse proxy are trusted controls. Do not ask Hermes to create,
+change, or troubleshoot them with Agent tools.
+
+## Verify MCP
+
+The add flow should discover exactly:
 
 - `open_secret_intake`
 - `get_secret_intake_status`
 - `cancel_secret_intake`
 
-Enable those three tools, then verify the connection:
+Enable those tools and test the connection:
 
 ```bash
 hermes mcp test openagent-secretbox
 ```
 
-Start a new Hermes session or run `/reload-mcp`. With the registered server
-name above, Hermes exposes these tool names:
+Start a new Hermes session or run `/reload-mcp`. Hermes exposes:
 
 - `mcp__openagent_secretbox__open_secret_intake`
 - `mcp__openagent_secretbox__get_secret_intake_status`
 - `mcp__openagent_secretbox__cancel_secret_intake`
 
-## 3. Install the skill
+## One-command Skill install
 
-After these files are published to the repository's default `main` branch,
-use Hermes's documented direct-URL form. This makes the fetched `SKILL.md`
-revision explicit instead of relying on source-router interpretation of a
-repository/subdirectory identifier.
-
-Inspect the community skill before installing it:
-
-```bash
-hermes skills inspect "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md"
-```
-
-Install the same URL into the `security` category:
+After reviewing the source revision, install the complete Hermes Skill with one
+command:
 
 ```bash
 hermes skills install "https://raw.githubusercontent.com/casterchenai/OpenAgent-secretbox/main/integrations/hermes/skills/openagent-secretbox/SKILL.md" --category security
 ```
 
-For a reproducible review, replace `main` in both commands with the same full
-Git commit SHA. A raw URL returns 404 until that revision and the integration
-files have been pushed to GitHub.
+For a reproducible deployment, replace `main` with a reviewed full Git commit
+SHA. The Skill links its required `references/` and `templates/` files, so
+Hermes fetches them with `SKILL.md` and rejects an incomplete bundle.
 
-Hermes does not enumerate the surrounding GitHub directory for a direct URL.
-It downloads `SKILL.md` plus only the paths that `SKILL.md` explicitly
-references under its allowlisted support directories. This skill explicitly
-links both bundled support files, so installation also fetches:
+Reload skills:
 
-- `references/trusted-user-boundary.md`
-- `templates/request-v1.json`
+```text
+/reload-skills
+```
 
-The install summary should list those paths with `SKILL.md`. If either fetch
-fails, Hermes rejects the bundle instead of silently installing an incomplete
-skill.
+Then ask Hermes naturally, without including any value:
 
-For a local checkout, add the skill collection to `~/.hermes/config.yaml`:
+```text
+Use OpenAgent SecretBox to collect the payment API key and certificate for this project.
+```
+
+Installing the Skill teaches Hermes how to use an already trusted SecretBox
+connection. It does not install the Python package or grant filesystem/network
+authority.
+
+For a local source checkout, point Hermes at the collection:
 
 ```yaml
 skills:
@@ -107,7 +178,7 @@ skills:
     - /absolute/path/to/OpenAgent-secretbox/integrations/hermes/skills
 ```
 
-On Windows, use a YAML-safe path such as:
+Use a YAML-safe path on Windows:
 
 ```yaml
 skills:
@@ -115,61 +186,60 @@ skills:
     - E:/path/to/OpenAgent-secretbox/integrations/hermes/skills
 ```
 
-Start a new session or run `/reload-skills`, then invoke:
+## Agent-visible behavior
 
-```text
-/openagent-secretbox prepare the credential intake for this project
-```
+In both modes Hermes sends metadata only and may create, poll, or cancel an
+intake. It never configures the service or reads a destination.
 
-`external_dirs` reads the complete skill directory in place, so the adjacent
-`references/` and `templates/` directories remain available without a separate
-download or copy step. Treat the checkout as agent-writable unless filesystem
-permissions make it read-only.
+In local mode, `open_secret_intake` returns an intake id, redacted status,
+expiry, and `browser_opened: true`. The browser opens locally and no URL crosses
+MCP.
 
-## MCP flow
+In remote mode, it returns the same public metadata with
+`browser_opened: false` and `portal_url`. The portal URL is always the configured
+HTTPS origin root, for example `https://secretbox.example.com/`. It contains no
+request-specific or authentication data and is safe to send through the user's
+remote chat channel.
 
-1. Hermes prepares a request object containing names, descriptions, relative
-   targets, and conservative write policy only. It omits `workspace_root` and
-   `allowed_targets`.
-2. Hermes calls `open_secret_intake`. The trusted MCP process applies its fixed
-   workspace/allowlist and opens the one-time URL directly in the local browser.
-3. MCP returns only a non-secret intake id, redacted status, and expiry. It
-   never returns the intake URL, token, session id, or submitted values.
-4. The user enters values in the browser. Hermes may call the status tool, or
-   cancel the intake at the user's request.
+Cancellation is effective only before secret application starts. If cancel
+returns `apply_in_progress`, poll the same `intake_id` until it reaches the
+authoritative `applied` or `failed` state.
 
-Cancellation is atomic only before secret application starts. If cancel returns
-`apply_in_progress`, do not retry or open a replacement intake; poll the existing
-`intake_id` until it reports the authoritative `applied` or `failed` result.
+## User acceptance checks
 
-Do not paste the intake URL, its fragment token, submitted values, or target
-file contents into Hermes.
+### Local loopback
 
-## Manual fallback
+- [ ] Ask Hermes for a test environment variable without giving its value.
+- [ ] Confirm the browser opens automatically on `127.0.0.1` or `localhost`.
+- [ ] Confirm chat and tool output contain no URL, token, or submitted value.
+- [ ] Submit a disposable value and confirm Hermes reports only its name,
+  relative target, action, and redacted status.
+- [ ] Remove the disposable target outside Hermes after the test.
 
-When the MCP tools are not configured, the skill may create and validate a
-metadata-only request file. It prints this command but never executes it:
+### Remote fixed gateway
 
-```bash
-secretbox serve --workspace "/absolute/project" --request "/absolute/request.json"
-```
+- [ ] Confirm the cloud security group exposes only the existing HTTPS port,
+  not `17321`.
+- [ ] Create two requests and confirm both chats show the same portal root with
+  no path, query, fragment, intake id, or token.
+- [ ] Open the portal from the user's device and confirm it identifies the
+  intended server workspace and exact relative targets before submission.
+- [ ] Upload a disposable file to a nested allowlisted target without manually
+  locating that server path.
+- [ ] Confirm refresh, reuse, expiry, and cancellation show clear portal states.
+- [ ] Confirm Hermes reports only redacted status and never reads the written
+  value or file.
+- [ ] Remove the disposable intake and target through the trusted operator path.
 
-The trusted user runs it in a separate local terminal. If browser auto-open
-fails, the user may privately add `--no-open`; the printed URL must never be
-pasted into chat or logs.
+## Security limit
 
-## Security boundary
+SecretBox prevents secrets from crossing chat and MCP transport. It cannot stop
+Hermes from reading a destination that its OS account can access. Use a
+separate OS identity or whole-process sandbox when the Agent must not read the
+secret after it is written.
 
-The MCP design prevents bearer URLs and submitted values from crossing the tool
-protocol, but the skill remains a procedural guardrail rather than a sandbox.
-Hermes Agent's official security model states that skills, plugins, MCP
-subprocess filtering, output redaction, and approval heuristics are not complete
-isolation boundaries. A Hermes process with unrestricted local filesystem
-access can still read files available to its OS account.
-
-For strict separation, run Hermes under a different OS identity or a
-whole-process sandbox that cannot read secret targets. See the
-[trusted user boundary](skills/openagent-secretbox/references/trusted-user-boundary.md).
+See the [trusted user boundary](skills/openagent-secretbox/references/trusted-user-boundary.md)
+for the full role split and exposure response.
 
 ## Compatibility basis
 

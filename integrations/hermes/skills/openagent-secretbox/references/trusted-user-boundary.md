@@ -1,127 +1,130 @@
 # Trusted User Boundary
 
-Read this reference before using SecretBox through Hermes Agent.
+Use this reference to distinguish the two supported deployments and respond to
+policy or exposure failures. In both modes, Hermes is an untrusted request
+author. The trusted user configures write authority once; Hermes may only
+create, poll, and cancel intakes within that authority.
 
-## Preferred MCP data flow
+## Local loopback mode
 
-```text
-Trusted user terminal (outside Hermes)
-  | registers secretbox-mcp with fixed --workspace/--allow-target policy
-  v
-Hermes Agent -> metadata-only open/status/cancel tool calls
-  v
-SecretBox MCP subprocess
-  | validates against startup policy; URL stays inside subprocess
-  | opens the default local browser directly
-  v
-Trusted browser: user enters values -> loopback SecretBox writer
-  v
-Approved workspace targets
-
-SecretBox MCP -> Hermes: intake id and redacted status only
-```
-
-The MCP server never returns its intake URL, fragment token, session id, or
-submitted values through MCP. The agent request omits `workspace_root` and
-`allowed_targets`; startup configuration supplies those trusted controls.
-
-## Manual fallback data flow
+Use this mode when Hermes and the user's browser run on the same desktop.
 
 ```text
-Hermes -> metadata-only request JSON and an unexecuted serve command
-  v
-Trusted user terminal -> secretbox serve -> trusted local browser
-  v
-Approved workspace targets
-
-User -> Hermes: status-only confirmation
+Hermes -> metadata-only MCP open/status/cancel
+  -> SecretBox opens a one-time loopback page in the local browser
+  -> user enters values or uploads files
+  -> SecretBox writes approved relative targets
+  -> Hermes receives redacted status only
 ```
 
-Fallback is less convenient because Hermes cannot use MCP status/cancel. It
-still keeps the bearer and values outside model/tool context when the user runs
-the command separately.
+The MCP process fixes `--workspace` and any `--allow-target` values at startup.
+It opens the browser itself and never returns the bearer URL through MCP.
 
-## Roles
+## Remote fixed-gateway mode
 
-Hermes is an untrusted request author. It may propose credential names and
-relative targets, call the three SecretBox MCP tools, and receive redacted
-status. It may not register or reconfigure the MCP server.
+Use this mode when Hermes runs on a server and the user reaches it through a Web
+UI, Feishu, WeChat, or another remote channel.
 
-The local user is the policy authority. In a separate trusted terminal, the
-user installs SecretBox, verifies the executable, and registers MCP with an
-absolute `--workspace`. Only the user may add startup `--allow-target` values.
+```text
+Hermes -> metadata-only MCP open/status/cancel
+  -> SecretBox creates a pending intake behind the fixed gateway
+  -> Hermes receives only an intake id, redacted status, and fixed portal root
+  -> chat may show https://secretbox.example.com/
+  -> user opens the portal and authenticates outside Hermes
+  -> SecretBox writes approved targets on the server
+```
 
-SecretBox MCP is the value handler. It binds intake to loopback, opens the URL
-directly in the local browser, consumes the one-time session, applies
-merge-only/no-overwrite policy, and returns redacted protocol data.
+The trusted operator configures the gateway once behind HTTPS on port 443. The
+internal SecretBox port remains fixed and loopback-bound, so new intakes do not
+require new ports or cloud security-group rules.
 
-Cancel is effective only before application starts. After the atomic submit
-transition wins, MCP returns `apply_in_progress`; the write continues to a real
-`applied` or `failed` terminal state and is never mislabeled `cancelled`.
+The portal URL is intentionally the same origin root for every request. It must
+not contain a session path, request id, query, fragment, token, or user info.
+The portal URL is public routing metadata and may be sent through chat. Portal
+authentication material, owner keys, intake URLs, and submitted values may not.
+
+## Authority split
+
+Hermes may:
+
+- define non-secret request metadata and relative targets;
+- call the configured open, status, and cancel tools;
+- relay a validated fixed HTTPS portal root in remote mode;
+- report redacted terminal results.
+
+The trusted user or operator must:
+
+- install and verify SecretBox;
+- choose the absolute workspace and target allowlist;
+- choose the gateway public origin, bind address, and fixed port;
+- generate and protect the gateway owner key;
+- configure TLS and the reverse proxy;
+- register MCP outside an active agent session.
+
+SecretBox must:
+
+- enforce the startup workspace and allowlist;
+- enforce merge-only and no-overwrite behavior;
+- keep browser credentials and submitted data out of MCP results;
+- return no URL in local mode and only the fixed portal root in remote mode;
+- preserve one authoritative terminal result when submit and cancel race.
 
 ## Invariants
 
-1. Do not place secret values in request JSON, skill frontmatter, Hermes config,
-   prompts, messages, tool arguments, logs, or command lines.
-2. Do not let the agent run `hermes mcp add`, `secretbox-mcp`, or
-   `secretbox serve`; those commands establish or bypass trusted process policy.
-3. Do not pass `workspace_root` or `allowed_targets` in an MCP request. The
-   request may declare only concrete relative write targets.
-4. Do not let Hermes receive, open, exchange, poll, or screenshot an intake URL.
-   MCP status polling uses only the non-secret `intake_id`.
-5. Do not send loopback intake URLs through gateway platforms or between hosts.
-6. Do not inspect target contents after apply. Use redacted MCP status or a
-   status-only user confirmation.
-7. Do not let an agent select startup `--allow-target`. Request metadata may
-   select concrete targets only within the user-fixed host policy.
+1. Keep secret values and file contents out of requests, prompts, chat, tool
+   arguments, logs, command lines, and skill configuration.
+2. Keep `workspace_root`, `allowed_targets`, public origin, bind settings, owner
+   key, and reverse-proxy configuration under trusted user control.
+3. Never let Hermes run `secretbox gateway keygen`, `secretbox-mcp`, `hermes
+   mcp add`, a gateway service command, or reverse-proxy setup.
+4. Never let Hermes receive or open a one-time intake URL. In remote mode, allow
+   only the fixed HTTPS origin root returned as `portal_url`.
+5. Never append an intake id or request id to the portal URL.
+6. Never inspect destination contents after apply. Use redacted status.
+7. Keep no-overwrite enabled when a conflict occurs. Resolve ownership outside
+   Hermes, then create a new intake.
 
-## Trusted registration checklist
+## Trusted setup checklist
 
-Before running `hermes mcp add` outside chat, verify:
+Before enabling the tools, verify:
 
-- `secretbox-mcp` is the expected installed OpenAgent SecretBox executable;
-- `--workspace` is the intended existing directory, not a link or junction;
-- `--args` is the final Hermes option and only reviewed server arguments follow;
-- any repeated `--allow-target` extension is necessary and narrowly scoped;
-- the probe discovers only open, status, and cancel tools;
-- `hermes mcp test openagent-secretbox` succeeds;
-- a new Hermes session or `/reload-mcp` exposes the expected namespaced tools.
+- the executable is the expected OpenAgent SecretBox installation;
+- the workspace is the intended existing directory, not a link or junction;
+- every additional allow-target pattern is necessary and narrow;
+- remote mode uses an HTTPS public origin with no path, query, or fragment;
+- the gateway binds to loopback behind a trusted TLS reverse proxy;
+- the owner key file is outside the workspace and unreadable by the Agent OS
+  identity where practical;
+- Hermes discovers exactly open, status, and cancel tools;
+- an end-to-end test writes only a disposable target and leaves no value in
+  chat, tool output, or service logs.
 
 The default startup allowlist is `.env`, `.env.*`, and `secrets/*`. Request
-metadata can choose concrete targets inside it but cannot expand it. The MCP
-server also forces no-overwrite and disables persistent backup.
+metadata may select a concrete target within that policy but may not expand it.
 
 ## What this boundary does not provide
 
-This flow prevents bearer and submitted-value transport through MCP. It does
-not contain a malicious or compromised agent running as the same OS user.
-Hermes Agent's official security policy states that skills/plugins run in
-process and that subprocess environment filtering, approval gates, redaction,
-and skill scanning are heuristics rather than full security boundaries.
+SecretBox keeps values out of model and tool transport. It does not contain a
+malicious or compromised agent that can read the destination with the same OS
+permissions.
 
-If Hermes can read the destination with its OS permissions, it can access the
-secret after SecretBox writes it. For strict separation:
-
-- run Hermes under a separate OS identity or whole-process sandbox;
-- deny that identity read access to `.env*` and `secrets/*` targets;
-- run SecretBox and the credential-consuming application under a trusted
-  identity that can access those targets;
-- keep untrusted web, email, and gateway input out of the trusted process.
+For strict separation, run Hermes under a separate OS identity or whole-process
+sandbox, deny it read access to secret targets, and let only SecretBox and the
+credential-consuming application access those targets.
 
 ## Exposure response
 
-If an intake URL appears in chat or agent-visible output, do not repeat it.
-Cancel the intake by its non-secret intake id when available, or stop/expire the
-fallback server, then create a fresh session. Deleting a message is not
-revocation.
+If a one-time intake URL or owner key appears in chat, do not repeat it. Revoke
+or rotate it outside Hermes, cancel the affected intake when possible, and
+create a fresh intake. Deleting the chat message is not revocation.
 
-If a credential value appears in chat, treat it as exposed. Revoke or rotate it
-at the issuing provider, then use a fresh SecretBox session for the replacement.
-Deleting local logs or chat history is not a substitute for rotation.
+If a credential value or sensitive file content appears in chat, treat it as
+exposed. Revoke or rotate the credential at its issuer, then collect the
+replacement through a fresh intake.
 
-If a target conflict occurs, keep no-overwrite enabled. Resolve the existing
-credential and file ownership manually outside Hermes, then create a new
-one-time intake.
+If `portal_url` contains a path other than `/`, a query, a fragment, user info,
+or a non-HTTPS remote scheme, do not relay it. Report a gateway configuration
+error without repeating the URL.
 
 ## Upstream security basis
 

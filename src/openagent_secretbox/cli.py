@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 import webbrowser
 from collections.abc import Callable, Mapping, Sequence
@@ -26,7 +27,14 @@ from . import __version__
 from .models import SecretRequest
 from .policy import PolicyError, build_policy
 from .schema import RequestValidationError, load_request
-from .writers import apply_request
+from .writers import (
+    WriteError,
+    _inspect_destination,
+    _is_link_or_reparse,
+    _same_file_identity,
+    _set_owner_only,
+    apply_request,
+)
 
 EXIT_USAGE = 2
 EXIT_NOT_FOUND = 3
@@ -36,6 +44,7 @@ DEFAULT_TTL_SECONDS = 600
 MAX_TTL_SECONDS = 86_400
 DEFAULT_ALLOWED_TARGETS = (".env", ".env.*", "secrets/*")
 STATE_ENV = "SECRETBOX_STATE_DIR"
+OWNER_KEY_BYTES = 48
 
 
 class CliError(Exception):
@@ -342,6 +351,175 @@ def _cmd_doctor(args: argparse.Namespace) -> CommandResult:
     )
 
 
+def _owner_key_output_path(raw_path: str) -> Path:
+    try:
+        expanded = Path(raw_path).expanduser()
+        output = Path(os.path.abspath(os.fspath(expanded)))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CliError(
+            "owner_key_target_unsafe",
+            "owner key output must be a new file in a safe existing directory",
+        ) from exc
+    path_parts = output.parts[1:] if output.drive else output.parts
+    if "\x00" in raw_path or (os.name == "nt" and any(":" in part for part in path_parts)):
+        raise CliError(
+            "owner_key_target_unsafe",
+            "owner key output must be a new file in a safe existing directory",
+        )
+    return output
+
+
+def _inspect_safe_owner_key_parents(path: Path) -> tuple[tuple[Path, os.stat_result], ...]:
+    snapshots: list[tuple[Path, os.stat_result]] = []
+    current = path.parent
+    while True:
+        try:
+            inspected = current.lstat()
+        except (OSError, ValueError) as exc:
+            raise CliError(
+                "owner_key_target_unsafe",
+                "owner key output must be a new file in a safe existing directory",
+            ) from exc
+        if _is_link_or_reparse(current, inspected) or not stat.S_ISDIR(inspected.st_mode):
+            raise CliError(
+                "owner_key_target_unsafe",
+                "owner key output must be a new file in a safe existing directory",
+            )
+        snapshots.append((current, inspected))
+        parent = current.parent
+        if parent == current:
+            return tuple(snapshots)
+        current = parent
+
+
+def _verify_owner_key_parents(
+    snapshots: tuple[tuple[Path, os.stat_result], ...],
+) -> None:
+    for path, expected in snapshots:
+        try:
+            current = path.lstat()
+        except (OSError, ValueError) as exc:
+            raise WriteError("owner key parent changed during creation") from exc
+        if (
+            _is_link_or_reparse(path, current)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_file_identity(expected, current)
+        ):
+            raise WriteError("owner key parent changed during creation")
+
+
+def _remove_created_owner_key(path: Path, expected: os.stat_result | None) -> None:
+    if expected is None:
+        return
+    try:
+        current = _inspect_destination(path)
+        if current is not None and _same_file_identity(expected, current):
+            path.unlink()
+    except (OSError, ValueError, WriteError):
+        pass
+
+
+def _create_owner_key(path: Path, content: bytes) -> None:
+    try:
+        existing = _inspect_destination(path)
+    except WriteError as exc:
+        raise CliError(
+            "owner_key_target_unsafe",
+            "owner key output must be a new file in a safe existing directory",
+        ) from exc
+    if existing is not None:
+        raise CliError(
+            "owner_key_exists",
+            "owner key output already exists; refusing to overwrite",
+        )
+    parent_snapshots = _inspect_safe_owner_key_parents(path)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = -1
+    opened: os.stat_result | None = None
+    complete = False
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or getattr(opened, "st_nlink", 1) != 1:
+            raise WriteError("new owner key target is not a private regular file")
+        _verify_owner_key_parents(parent_snapshots)
+        current = _inspect_destination(path)
+        if current is None or not _same_file_identity(opened, current):
+            raise WriteError("owner key target changed during creation")
+
+        # Permissions are established before any credential bytes reach the file.
+        _set_owner_only(descriptor, path)
+        _verify_owner_key_parents(parent_snapshots)
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("owner key write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+
+        # Re-run the platform verifier after the write and re-check file identity.
+        _set_owner_only(descriptor, path)
+        verified = os.fstat(descriptor)
+        _verify_owner_key_parents(parent_snapshots)
+        current = _inspect_destination(path)
+        if (
+            current is None
+            or not stat.S_ISREG(verified.st_mode)
+            or getattr(verified, "st_nlink", 1) != 1
+            or not _same_file_identity(opened, verified)
+            or not _same_file_identity(verified, current)
+            or (os.name != "nt" and stat.S_IMODE(verified.st_mode) != 0o600)
+        ):
+            raise WriteError("unable to verify owner key target")
+        os.close(descriptor)
+        descriptor = -1
+        complete = True
+    except FileExistsError as exc:
+        raise CliError(
+            "owner_key_exists",
+            "owner key output already exists; refusing to overwrite",
+        ) from exc
+    except (OSError, ValueError, WriteError) as exc:
+        raise CliError(
+            "owner_key_write_failed",
+            "cannot create the gateway owner key securely",
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            if opened is None:
+                try:
+                    opened = os.fstat(descriptor)
+                except OSError:
+                    pass
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if not complete:
+            _remove_created_owner_key(path, opened)
+
+
+def _cmd_gateway_keygen(args: argparse.Namespace) -> CommandResult:
+    output = _owner_key_output_path(args.output)
+    material = base64.urlsafe_b64encode(secrets.token_bytes(OWNER_KEY_BYTES)).rstrip(b"=")
+    _create_owner_key(output, material + b"\n")
+    mode = "owner-only" if os.name == "nt" else "0600"
+    return CommandResult(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "created",
+            "artifact": "gateway_owner_key",
+            "mode": mode,
+        },
+        human=f"gateway owner key created with {mode} permissions",
+    )
+
+
 def _cmd_serve(args: argparse.Namespace) -> CommandResult:
     workspace = Path(args.workspace).expanduser()
     if not workspace.is_dir():
@@ -521,6 +699,19 @@ def _build_parser() -> SecretboxArgumentParser:
     doctor.add_argument("--workspace")
     doctor.add_argument("--request", dest="request_path")
     doctor.set_defaults(handler=_cmd_doctor)
+
+    gateway = commands.add_parser("gateway")
+    _add_json_flag(gateway)
+    _add_state_dir_flag(gateway)
+    gateway_commands = gateway.add_subparsers(
+        dest="gateway_command",
+        parser_class=SecretboxArgumentParser,
+    )
+    gateway_keygen = gateway_commands.add_parser("keygen")
+    _add_json_flag(gateway_keygen)
+    _add_state_dir_flag(gateway_keygen)
+    gateway_keygen.add_argument("--output", required=True)
+    gateway_keygen.set_defaults(handler=_cmd_gateway_keygen)
 
     request = commands.add_parser("request")
     _add_json_flag(request)

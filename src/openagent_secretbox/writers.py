@@ -209,7 +209,11 @@ def _set_windows_owner_only(path: Path) -> bool:
     _run_icacls(path, "/grant:r", f"{sid_argument}:(F)")
     _run_icacls(path, "/setowner", sid_argument)
     _run_icacls(path, "/inheritance:r")
-    for rule_sid in sorted({rule[0] for rule in before[2]} - {sid}):
+    # Removing inheritance can delete inherited ACEs. Re-inspect before issuing
+    # removals so a vanished inherited SID cannot turn a secure repair into a
+    # false failure.
+    after_inheritance = _inspect_windows_acl(path)
+    for rule_sid in sorted({rule[0] for rule in after_inheritance[2]} - {sid}):
         _run_icacls(path, "/remove", f"*{rule_sid}")
 
     verified = _inspect_windows_acl(path)

@@ -81,6 +81,11 @@ def main() -> int:
             environment=environment,
         )
         _run(
+            [str(scripts / f"secretbox-worker-mcp{executable_suffix}"), "--help"],
+            cwd=run_directory,
+            environment=environment,
+        )
+        _run(
             [str(python), "-c", PACKAGE_SMOKE, str(environment_root)],
             cwd=run_directory,
             environment=environment,

@@ -1,0 +1,9 @@
+**
+!src/
+!src/openagent_secretbox/
+!src/openagent_secretbox/**/*.py
+!deploy/
+!deploy/linux-worker/
+!deploy/linux-worker/*.py
+!deploy/linux-worker/Dockerfile
+**/__pycache__/

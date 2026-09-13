@@ -1,0 +1,153 @@
+name: secretbox-worker-lab
+
+x-image: &image
+  image: secretbox-worker-lab:local
+  build:
+    context: ../..
+    dockerfile: deploy/linux-worker/Dockerfile
+
+x-harden: &harden
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 64
+  mem_limit: 256m
+  logging:
+    driver: local
+    options:
+      max-size: 5m
+      max-file: "2"
+
+services:
+  bootstrap:
+    <<: *image
+    command: [python3, /app/lab.py, bootstrap]
+    network_mode: none
+    healthcheck:
+      test: [CMD, python3, -c, "from pathlib import Path; assert Path('/worker-config/bootstrap.ready').exists() and Path('/tls-worker/identity.key').exists()"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - db-secrets:/db-secrets
+      - provider-secrets:/provider-secrets
+      - provider-socket:/provider-socket
+      - provider-state:/provider-state
+      - worker-state:/worker-state
+      - worker-config:/worker-config
+      - backup:/backup
+      - tls-db:/tls-db
+      - tls-worker:/tls-worker
+      - tls-agent:/tls-agent
+      - tls-owner:/tls-owner
+
+  database:
+    <<: *image
+    entrypoint: [docker-entrypoint.sh]
+    command: [postgres, -c, ssl=on, -c, ssl_cert_file=/tls/identity.crt,
+              -c, ssl_key_file=/tls/identity.key, -c, log_statement=none,
+              -c, log_min_error_statement=panic]
+    depends_on:
+      bootstrap: {condition: service_healthy}
+    environment:
+      POSTGRES_PASSWORD_FILE: /db-secrets/admin-password
+      POSTGRES_DB: sbx_lab
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    networks: [database]
+    volumes:
+      - db-secrets:/db-secrets:ro
+      - tls-db:/tls:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d sbx_lab]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+    mem_limit: 512m
+    pids_limit: 128
+
+  provision:
+    <<: *image
+    command: [python3, /app/lab.py, provision]
+    depends_on:
+      database: {condition: service_healthy}
+    networks: [database]
+    volumes:
+      - db-secrets:/db-secrets:ro
+      - tls-db:/db-tls:ro
+      - worker-config:/worker-config
+      - backup:/backup
+
+  provider:
+    <<: [*image, *harden]
+    user: "10002:10001"
+    command: [python3, -m, openagent_secretbox.linux_worker.provider]
+    network_mode: none
+    depends_on:
+      provision: {condition: service_completed_successfully}
+    volumes:
+      - provider-secrets:/secrets:ro
+      - provider-socket:/run/provider
+      - provider-state:/state
+
+  worker:
+    <<: [*image, *harden]
+    user: "10001:10001"
+    depends_on:
+      provision: {condition: service_completed_successfully}
+      provider: {condition: service_started}
+    networks: [database, control]
+    stop_grace_period: 45s
+    volumes:
+      - provider-socket:/run/provider:ro
+      - worker-state:/state
+      - worker-config:/config:ro
+      - backup:/backup:ro
+      - tls-worker:/tls:ro
+
+  ingress:
+    <<: [*image, *harden]
+    user: "10006:10006"
+    command: [python3, -m, openagent_secretbox.linux_worker.tunnel]
+    depends_on:
+      worker: {condition: service_started}
+    networks: [control, edge]
+    ports: ["127.0.0.1:17443:8443"]
+
+  agent:
+    <<: [*image, *harden]
+    user: "10003:10003"
+    command: [python3, -c, "import time; time.sleep(86400)"]
+    depends_on:
+      worker: {condition: service_started}
+    networks: [control]
+    volumes: [tls-agent:/tls:ro]
+
+  owner:
+    <<: [*image, *harden]
+    user: "10004:10004"
+    command: [python3, -c, "import time; time.sleep(86400)"]
+    depends_on:
+      worker: {condition: service_started}
+    networks: [control]
+    volumes: [tls-owner:/tls:ro]
+
+networks:
+  database: {internal: true}
+  control: {internal: true}
+  edge: {}
+
+volumes:
+  # All test passwords/keys are generated inside Linux and held only in RAM volumes.
+  db-secrets: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  provider-secrets: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  provider-socket: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  tls-db: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  tls-worker: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  tls-agent: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  tls-owner: {driver_opts: {type: tmpfs, device: tmpfs, o: "size=1m,mode=0700"}}
+  worker-state:
+  provider-state:
+  worker-config:
+  backup:
+  pg-data:

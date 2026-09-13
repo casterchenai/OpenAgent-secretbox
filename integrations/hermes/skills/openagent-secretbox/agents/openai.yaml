@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenAgent SecretBox"
+  short_description: "Collect secrets outside Agent chat"
+  default_prompt: "Use $openagent-secretbox to collect credentials for this project without placing values in chat."

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -13,12 +14,14 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from openagent_secretbox import mcp_server, writers
+from openagent_secretbox.gateway import GatewayBroker, UnknownIntake
 from openagent_secretbox.mcp_server import (
     MAX_RETAINED_TERMINAL_INTAKES,
     IntakeManager,
     create_mcp_server,
 )
-from openagent_secretbox.server import serve_once
+from openagent_secretbox.server import UnknownSession, serve_once
 
 
 def _request(workspace: Path, request_id: str = "mcp-test") -> dict[str, Any]:
@@ -491,6 +494,142 @@ def test_fastmcp_tools_do_not_offer_workspace_or_secret_parameters(tmp_path: Pat
         assert by_name["cancel_secret_intake"].annotations.destructiveHint is True
     finally:
         manager.close()
+
+
+def test_gateway_mode_returns_one_fixed_portal_without_opening_local_browser(
+    tmp_path: Path,
+) -> None:
+    opened: list[str] = []
+    broker = GatewayBroker(
+        "https://secretbox.example.com",
+        "test-owner-access-key-with-enough-entropy",
+    )
+    manager = IntakeManager(
+        tmp_path,
+        max_active=2,
+        browser_open=lambda url: not opened.append(url),
+        gateway_broker=broker,
+    )
+    try:
+        first = manager.open_intake(_request(tmp_path, "remote-first"), ttl_seconds=60)
+        second = manager.open_intake(_request(tmp_path, "remote-second"), ttl_seconds=60)
+
+        assert opened == []
+        assert first["status"] == second["status"] == "awaiting_input"
+        assert first["browser_opened"] is second["browser_opened"] is False
+        assert first["portal_url"] == second["portal_url"] == "https://secretbox.example.com"
+        assert first["intake_id"] != second["intake_id"]
+        serialized = json.dumps([first, second])
+        assert "session_id" not in serialized
+        assert "token" not in serialized.lower()
+        assert "/requests/" not in serialized
+
+        limited = manager.open_intake(_request(tmp_path, "remote-third"), ttl_seconds=60)
+        assert limited["error"]["code"] == "too_many_active_intakes"
+        assert manager.cancel_intake(first["intake_id"])["status"] == "cancelled"
+        assert manager.get_status(first["intake_id"])["status"] == "cancelled"
+        replacement = manager.open_intake(_request(tmp_path, "remote-third"), ttl_seconds=60)
+        assert replacement["status"] == "awaiting_input"
+        assert replacement["portal_url"] == first["portal_url"]
+    finally:
+        manager.close()
+
+
+def test_manager_close_clears_gateway_intakes_and_authentication(tmp_path: Path) -> None:
+    broker = GatewayBroker(
+        "https://secretbox.example.com",
+        "test-owner-access-key-with-enough-entropy",
+    )
+    manager = IntakeManager(tmp_path, gateway_broker=broker)
+    opened = manager.open_intake(_request(tmp_path, "close-remote"), ttl_seconds=60)
+    session_id = broker._record(opened["intake_id"]).session_id
+    auth_token, _ = broker._new_auth_session()
+
+    manager.close()
+
+    assert broker._intakes == {}
+    assert broker._sessions == {}
+    assert broker._auth_sessions == {}
+    assert broker._authenticate(auth_token) is False
+    with pytest.raises(UnknownIntake):
+        broker.status(opened["intake_id"])
+    with pytest.raises(UnknownSession):
+        broker.store.get(session_id)
+
+
+def test_gateway_cli_options_are_all_or_nothing_and_loopback_only(tmp_path: Path) -> None:
+    parser = mcp_server._build_parser()
+    local = parser.parse_args(["--workspace", str(tmp_path)])
+    assert mcp_server._gateway_arguments(local) is None
+
+    partial = parser.parse_args(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--gateway-public-origin",
+            "https://secretbox.example.com",
+        ]
+    )
+    with pytest.raises(mcp_server.McpConfigurationError, match="all four"):
+        mcp_server._gateway_arguments(partial)
+
+    direct_public_bind = parser.parse_args(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--gateway-public-origin",
+            "https://secretbox.example.com",
+            "--gateway-bind",
+            "0.0.0.0",
+            "--gateway-port",
+            "17321",
+            "--gateway-owner-key-file",
+            str(tmp_path / "owner.key"),
+        ]
+    )
+    with pytest.raises(mcp_server.McpConfigurationError, match="127.0.0.1"):
+        mcp_server._gateway_arguments(direct_public_bind)
+
+
+def test_gateway_owner_key_read_accepts_only_presecured_file(tmp_path: Path) -> None:
+    owner_key = "owner-key-" + "A" * 48
+    key_file = tmp_path / "owner.key"
+    key_file.write_text(owner_key + "\n", encoding="ascii")
+    if os.name == "nt":
+        writers._set_windows_owner_only(key_file)
+    else:
+        key_file.chmod(0o600)
+
+    assert mcp_server._read_gateway_owner_key(str(key_file)) == owner_key
+    if sys.platform != "win32":
+        assert key_file.stat().st_mode & 0o777 == 0o600
+
+    invalid = tmp_path / "invalid.key"
+    invalid.write_text("too-short\n", encoding="ascii")
+    with pytest.raises(mcp_server.McpConfigurationError) as raised:
+        mcp_server._read_gateway_owner_key(str(invalid))
+    assert "too-short" not in str(raised.value)
+
+
+def test_gateway_owner_key_read_rejects_insecure_file_without_repair(tmp_path: Path) -> None:
+    key_file = tmp_path / "insecure-owner.key"
+    key_file.write_text("owner-key-" + "B" * 48 + "\n", encoding="ascii")
+    if os.name == "nt":
+        writers._run_icacls(key_file, "/grant", "*S-1-1-0:(R)")
+        before: object = writers._inspect_windows_acl(key_file)
+    else:
+        key_file.chmod(0o644)
+        before = key_file.stat().st_mode & 0o777
+
+    with pytest.raises(mcp_server.McpConfigurationError):
+        mcp_server._read_gateway_owner_key(str(key_file))
+
+    after: object
+    if os.name == "nt":
+        after = writers._inspect_windows_acl(key_file)
+    else:
+        after = key_file.stat().st_mode & 0o777
+    assert after == before
 
 
 def test_stdio_entrypoint_negotiates_without_non_protocol_stdout(tmp_path: Path) -> None:

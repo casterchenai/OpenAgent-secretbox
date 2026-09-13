@@ -114,6 +114,7 @@ class _Session:
     error_code: str | None = None
     exchanged_at: float | None = None
     completed_at: float | None = None
+    discard_on_terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -378,7 +379,7 @@ class SessionStore:
     issue = create_session
 
     def _purge_locked(self, now: float) -> None:
-        for session in self._sessions.values():
+        for session in tuple(self._sessions.values()):
             # TTL bounds how long the user may start an intake. Once apply has
             # started, its synchronous result owns the only legal next state.
             if session.expires_at <= now and session.state in {"pending", "exchanged"}:
@@ -391,6 +392,14 @@ class SessionStore:
             indexed_session = self._sessions.get(sid)
             if indexed_session is None or indexed_session.state != "pending":
                 self._token_index.pop(digest, None)
+        for session in tuple(self._sessions.values()):
+            if session.discard_on_terminal and session.state in {
+                "applied",
+                "failed",
+                "cancelled",
+                "expired",
+            }:
+                self._discard_locked(session)
 
     def exchange(self, session_id: str, token: str) -> ExchangeResult:
         if not isinstance(session_id, str) or not session_id or len(session_id) > 100:
@@ -476,6 +485,56 @@ class SessionStore:
             return self._status_locked(session)
 
     status = get
+
+    def discard_terminal(self, session_id: str) -> bool:
+        """Forget a completed session without racing an in-progress apply.
+
+        Long-lived control planes may retain their own bounded, metadata-only
+        snapshot after polling. Pending, exchanged, and submitted sessions are
+        never discarded by this method.
+        """
+
+        with self._lock:
+            self._purge_locked(self._clock())
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            if session.state not in {"applied", "failed", "cancelled", "expired"}:
+                return False
+            self._discard_locked(session)
+            return True
+
+    def discard_when_terminal(self, session_id: str) -> bool:
+        """Discard now or mark an in-progress apply for immediate terminal cleanup."""
+
+        with self._lock:
+            self._purge_locked(self._clock())
+            session = self._sessions.get(session_id)
+            if session is None:
+                return True
+            if session.state in {"applied", "failed", "cancelled", "expired"}:
+                self._discard_locked(session)
+                return True
+            session.discard_on_terminal = True
+            return False
+
+    def _discard_locked(self, session: _Session) -> None:
+        self._token_index.pop(session.token_digest, None)
+        session.apply_fn = None
+        session.csrf_digest = None
+        session.cookie_digest = None
+        self._sessions.pop(session.session_id, None)
+
+    def _terminal_status_locked(self, session: _Session) -> dict[str, Any]:
+        result = self._status_locked(session)
+        if session.discard_on_terminal and session.state in {
+            "applied",
+            "failed",
+            "cancelled",
+            "expired",
+        }:
+            self._discard_locked(session)
+        return result
 
     def authorize(
         self, session_id: str, csrf_token: str | None, session_cookie: str | None = None
@@ -577,6 +636,7 @@ class SessionStore:
                 session.state = "failed"
                 session.error_code = "apply_failed"
                 session.completed_at = self._clock()
+                self._terminal_status_locked(session)
             raise ApplyFailed() from exc
         finally:
             # Best effort release of this local reference; callers should also drop
@@ -590,7 +650,7 @@ class SessionStore:
                 session.state = "failed"
                 session.error_code = "apply_blocked"
             session.completed_at = self._clock()
-            return self._status_locked(session)
+            return self._terminal_status_locked(session)
 
     def cancel_pending(self, session_id: str) -> dict[str, Any]:
         """Atomically cancel an intake only if secret application has not started.
@@ -610,7 +670,7 @@ class SessionStore:
                 session.state = "cancelled"
                 session.completed_at = now
                 self._token_index.pop(session.token_digest, None)
-            return self._status_locked(session)
+            return self._terminal_status_locked(session)
 
     def cancel(
         self, session_id: str, csrf_token: str, *, session_cookie: str | None = None
@@ -621,7 +681,7 @@ class SessionStore:
                 raise InvalidState()
             session.state = "cancelled"
             session.completed_at = self._clock()
-            return self._status_locked(session)
+            return self._terminal_status_locked(session)
 
     def all_terminal(self, session_id: str | None = None) -> bool:
         with self._lock:
