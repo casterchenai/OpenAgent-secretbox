@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -14,6 +15,9 @@ async def main():
     root = Path(__file__).resolve().parents[2]
     server = StdioServerParameters(
         command=sys.executable,
+        env={"COMPOSE_PROJECT_NAME": os.environ["COMPOSE_PROJECT_NAME"]}
+        if "COMPOSE_PROJECT_NAME" in os.environ
+        else None,
         cwd=str(root.parent),
         args=[
             "-m",

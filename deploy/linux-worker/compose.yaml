@@ -117,7 +117,7 @@ services:
   agent:
     <<: [*image, *harden]
     user: "10003:10003"
-    command: [python3, -c, "import time; time.sleep(86400)"]
+    command: [python3, -c, "import threading; threading.Event().wait()"]
     depends_on:
       worker: {condition: service_started}
     networks: [control]
@@ -126,7 +126,7 @@ services:
   owner:
     <<: [*image, *harden]
     user: "10004:10004"
-    command: [python3, -c, "import time; time.sleep(86400)"]
+    command: [python3, -c, "import threading; threading.Event().wait()"]
     depends_on:
       worker: {condition: service_started}
     networks: [control]

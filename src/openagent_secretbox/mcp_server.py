@@ -770,12 +770,17 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="trusted workspace root fixed for the lifetime of this MCP process",
     )
-    parser.add_argument(
+    targets = parser.add_mutually_exclusive_group()
+    targets.add_argument(
         "--allow-target",
         action="append",
         default=[],
         metavar="PATTERN",
         help="trusted target pattern; repeat to extend the default local policy",
+    )
+    targets.add_argument(
+        "--only-target", action="append", metavar="PATTERN",
+        help="replace default targets with this trusted allowlist; repeat as needed",
     )
     parser.add_argument(
         "--max-active",
@@ -834,7 +839,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         manager = IntakeManager(
             args.workspace,
-            allowed_targets=DEFAULT_ALLOWED_TARGETS + tuple(args.allow_target),
+            allowed_targets=tuple(args.only_target) if args.only_target else
+            DEFAULT_ALLOWED_TARGETS + tuple(args.allow_target),
             max_active=args.max_active,
             gateway_broker=gateway_broker,
             gateway_runtime=runtime,

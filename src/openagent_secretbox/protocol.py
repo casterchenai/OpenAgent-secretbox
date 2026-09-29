@@ -55,7 +55,7 @@ _ACTION_FIELDS = frozenset({"type", "name", "action", "target", "mode"})
 _CONFLICT_FIELDS = frozenset({"type", "name", "action", "target"})
 _BLOCKED_FIELDS = frozenset({"code", "name", "target"})
 _BLOCK_CODES = frozenset(
-    {"invalid_request_or_workspace", "invalid_values", "apply_failed"}
+    {"invalid_request_or_workspace", "invalid_values", "apply_failed", "env_syntax_invalid"}
 )
 _MCP_ERROR_CODES = frozenset({"apply_blocked", "apply_failed", "expired"})
 _MCP_PUBLIC_ERRORS = frozenset(

@@ -141,6 +141,29 @@ this code does not automatically reload an already-running app's tool catalog.
 
 ## Restart, shutdown and reset
 
+The stdio MCP bridge is started by its MCP host for a connection; running a
+detached copy is not a substitute for registering it in that host. If tools are
+missing, check `codex mcp get secretbox-linux-worker` first. Registration does
+not imply that Docker or the backend containers are running. This lab does not
+configure Windows login startup or automatic Docker restart recovery.
+
+The agent and owner containers wait indefinitely (older versions exited after
+24 hours). Credentials still deliberately expire after seven days and reside in
+volatile storage: this lab is not an unattended permanent service. Automatic
+restart policies alone cannot safely repair lost credentials.
+
+On Windows, Docker Desktop may fail before the engine starts while removing a
+stale `dockerInference` or `engine.sock` reparse point. After quitting Docker
+Desktop, `deploy/linux-worker/Start-DockerDesktopSafe.ps1` preserves the affected
+runtime directories under timestamped `.stale-*` names and launches Docker. It
+does not delete any data or stop a running Docker process. This is a workaround,
+not a proven fix to the underlying Windows/Docker socket incompatibility.
+
+To retain a broken lab's data while creating a fresh isolated test instance, set
+`COMPOSE_PROJECT_NAME` to a new name before `compose up`. Use the same environment
+variable in the MCP registration and smoke test. Only one instance may bind
+port 17443. Never reset existing volumes implicitly to make startup succeed.
+
 To restart the worker without running provisioning dependencies:
 
 ```powershell

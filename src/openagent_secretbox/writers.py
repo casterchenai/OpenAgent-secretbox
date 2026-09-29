@@ -1003,7 +1003,9 @@ def apply_request(
                     continue
                 if file_result.action:
                     written.append(file_result.action)
-    except (EnvParseError, WriteError, PolicyError, OSError, ValueError):
+    except EnvParseError:
+        blocked.append(_block("env_syntax_invalid"))
+    except (WriteError, PolicyError, OSError, ValueError):
         # Exception text is deliberately omitted: filesystem and parser errors
         # can contain attacker-controlled input or portions of a secret.
         blocked.append(_block("apply_failed"))

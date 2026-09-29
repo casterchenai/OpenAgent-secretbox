@@ -52,6 +52,16 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Run tests
         run: python -m pytest
+      - name: Validate Windows management scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($path in @('deploy/windows/Manage-SecretBox.ps1', 'deploy/linux-worker/Start-DockerDesktopSafe.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }
       - name: Validate request examples through the CLI
         run: >-
           python -c "from pathlib import Path; from openagent_secretbox.cli import main;

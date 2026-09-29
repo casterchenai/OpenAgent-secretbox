@@ -217,7 +217,8 @@
           "enum": [
             "invalid_request_or_workspace",
             "invalid_values",
-            "apply_failed"
+            "apply_failed",
+            "env_syntax_invalid"
           ]
         },
         "name": {

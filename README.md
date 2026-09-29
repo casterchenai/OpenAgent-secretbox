@@ -1,5 +1,15 @@
 # OpenAgent SecretBox
 
+## Windows / Codex App：稳定启用本机录入
+
+如果你只想在聊天之外填写 API Key，使用 **`openagent-secretbox` 录入 MCP**，
+不需要 Docker。`secretbox-linux-worker` 是远程任务执行服务，不能替代录入工具。
+
+新增[独立安装、健康检查、注册修复与回退](docs/windows-stable-install.md)：
+从审核过的 wheel 安装到用户专用目录，脱离开发仓库和开发虚拟环境；
+按固定项目授权，仅允许 `.env.local`。服务由 Codex 按需启动。
+安装后的管理入口提供 `Doctor`、`Repair`、`Rollback`，不是反复要求用户重启。
+
 ## 受限 Linux 执行 Worker
 
 新增 **Phase 2 真实 Linux 容器执行链路**：独立凭据服务、mTLS 任务 API、
